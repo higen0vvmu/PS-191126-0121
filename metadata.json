@@ -1,0 +1,6 @@
+{
+  "name": "Plan Studio",
+  "description": "Metric-only interior architecture prototyping studio with 2D drafting, 3D PBR visualization, and multi-part parametric furniture editing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
