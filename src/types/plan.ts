@@ -61,6 +61,7 @@ export type EditorTool =
   | 'wall_arc'
   | 'split_wall'
   | 'chimney'
+  | 'railing'
   | 'door'
   | 'window'
   | 'arch'
@@ -485,6 +486,7 @@ export interface FurnitureLightSource {
   zMm: number; // local Z elevation relative to furniture base (0 = base)
   aimAzimuthDeg: number; // horizontal aim relative to local +Y (0 = forward/+Y, 90 = right/+X)
   aimElevationDeg: number; // -90 straight down to +90 straight up
+  aimRollDeg?: number; // -180 to 180 roll around emission axis (for asymmetric area/linear lights)
   coneAngleDeg?: number; // SpotLight half-cone angle in degrees (10 - 80)
   penumbra?: number; // SpotLight edge softness (0 - 1)
   widthMm?: number; // Area or Linear light width
@@ -530,6 +532,8 @@ export interface CatalogTemplate {
   defaultMountingType?: MountingType;
   defaultMountingFace?: MountingFace;
   parts: FurniturePart[];
+  isLight?: boolean;
+  lightingEnabled?: boolean;
   lights?: FurnitureLightSource[];
   glbEmissiveOverrides?: GlbMaterialEmissiveOverride[];
   isCustom?: boolean;
@@ -570,6 +574,8 @@ export interface FurnitureInstance {
   footprintPolygon?: Point2D[];
   representation?: FurnitureRepresentation;
   lightConfig?: LightConfig;
+  isLight?: boolean;
+  lightingEnabled?: boolean;
   lights?: FurnitureLightSource[];
   glbEmissiveOverrides?: GlbMaterialEmissiveOverride[];
   zOrder?: number;
@@ -627,6 +633,71 @@ export type ArchElementType =
   | 'balcony'
   | 'fireplace';
 
+export type RailingStyleId =
+  | 'traditional_balusters'
+  | 'horizontal_metal'
+  | 'glass_panel'
+  | 'frameless_glass'
+  | 'cable'
+  | 'solid_panel'
+  | 'modern_minimalist'
+  | 'handrail_only';
+
+export type RailingMountingMethod =
+  | 'top_mount'
+  | 'side_fascia'
+  | 'embedded'
+  | 'wall_bracket';
+
+export type RailingHandrailShape = 'round' | 'square' | 'rectangular' | 'oval';
+
+export type RailingPostShape = 'square' | 'round' | 'flat';
+
+export type RailingGlassTint = 'clear' | 'low_iron' | 'bronze' | 'smoke';
+
+export interface RailingPathNode {
+  xMm: number; // local X relative to ArchElement origin (mm)
+  yMm: number; // local Y relative to ArchElement origin (mm)
+  elevationMm?: number; // elevation offset relative to ArchElement elevationMm (mm)
+}
+
+export interface RailingEdgeToggles {
+  front?: boolean;
+  back?: boolean;
+  left?: boolean;
+  right?: boolean;
+}
+
+export interface RailingConfig {
+  style: RailingStyleId;
+  nodes: RailingPathNode[];
+  closed?: boolean;
+  heightMm: number; // Overall vertical railing height above deck/nosing (mm)
+  widthMm: number; // Overall balustrade assembly footprint width/thickness (mm)
+  postSpacingMm: number; // Target spacing between structural posts (mm)
+  balusterSpacingMm: number; // Spacing between vertical balusters (mm)
+  horizontalRailCount: number; // Count of horizontal metal bars for horizontal_metal style
+  cableCount: number; // Count of tension cables for cable style
+  handrailShape: RailingHandrailShape;
+  handrailWidthMm: number; // Width across handrail (mm)
+  handrailThicknessMm: number; // Vertical height/thickness of handrail (mm)
+  postShape: RailingPostShape;
+  postSizeMm: number; // Width/diameter of intermediate posts (mm)
+  endPostSizeMm?: number; // Optional heavier newel/end post size (mm)
+  balusterSizeMm: number; // Width/diameter of pickets, bars, or cables (mm)
+  panelThicknessMm: number; // Glass or solid panel thickness (mm)
+  bottomRailEnabled: boolean;
+  bottomRailHeightMm: number; // Clearance from floor/nosing to bottom rail (mm)
+  mountingMethod: RailingMountingMethod;
+  material: MaterialPreset; // Primary frame/post/rail material
+  handrailMaterial?: MaterialPreset; // Optional contrasting handrail material (e.g. wood cap)
+  handrailColor?: string;
+  secondaryMaterial?: MaterialPreset; // Infill material (glass / wood / solid cladding)
+  secondaryColor: string; // Infill or panel tint color
+  glassTint: RailingGlassTint;
+  accentColor: string; // Hardware / clamp / spigot / bracket finish
+}
+
 export interface ArchElement {
   id: string;
   name: string;
@@ -643,6 +714,11 @@ export interface ArchElement {
   material: MaterialPreset;
   stepCount?: number;
   hasRailing?: boolean;
+  railingLeft?: boolean;
+  railingRight?: boolean;
+  railingEdges?: RailingEdgeToggles;
+  stairTurnDirection?: 'left' | 'right';
+  railing?: RailingConfig;
   connectToCeiling?: boolean;
   attachedWallId?: string;
   attachedFace?: 'left' | 'right';

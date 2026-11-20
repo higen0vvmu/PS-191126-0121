@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Keyboard, RotateCcw, Sliders, X } from 'lucide-react';
+import { Keyboard, MonitorCog, RotateCcw, Sliders, X } from 'lucide-react';
 import { GridSizeMm, ProjectSettings, UnitDisplay } from '../types/plan';
 import {
   DEFAULT_KEYBINDS,
@@ -9,13 +9,22 @@ import {
   KeybindMap,
   rebindKey,
 } from '../utils/keybinds';
+import type {
+  ConcreteGraphicsPresetId,
+  GraphicsSettings,
+} from '../utils/graphicsSettings';
+import { GraphicsSettingsPanel } from './GraphicsSettingsPanel';
 
 interface SettingsModalProps {
-  initialTab?: 'general' | 'keybinds';
+  initialTab?: 'general' | 'keybinds' | 'graphics';
   keybinds: KeybindMap;
   settings: ProjectSettings;
+  graphicsSettings: GraphicsSettings;
   onChangeKeybinds: (next: KeybindMap) => void;
   onUpdateSettings: (partial: Partial<ProjectSettings>) => void;
+  onSelectGraphicsPreset: (preset: ConcreteGraphicsPresetId) => void;
+  onUpdateGraphicsSettings: (partial: Partial<GraphicsSettings>) => void;
+  onResetGraphicsSettings: () => void;
   onClose: () => void;
 }
 
@@ -29,11 +38,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   initialTab = 'keybinds',
   keybinds,
   settings,
+  graphicsSettings,
   onChangeKeybinds,
   onUpdateSettings,
+  onSelectGraphicsPreset,
+  onUpdateGraphicsSettings,
+  onResetGraphicsSettings,
   onClose,
 }) => {
-  const [tab, setTab] = useState<'general' | 'keybinds'>(initialTab);
+  const [tab, setTab] = useState<'general' | 'keybinds' | 'graphics'>(initialTab);
   const [listeningAction, setListeningAction] = useState<KeybindAction | null>(null);
   const [conflictNote, setConflictNote] = useState<string | null>(null);
 
@@ -104,6 +117,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 <Sliders className="w-3.5 h-3.5" />
                 <span>General</span>
+              </button>
+              <button
+                type="button"
+                data-testid="settings-tab-graphics"
+                onClick={() => setTab('graphics')}
+                className={`px-3 py-1 rounded-md flex items-center gap-1.5 font-medium cursor-pointer ${
+                  tab === 'graphics'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-500 hover:text-slate-900 dark:hover:text-slate-200'
+                }`}
+              >
+                <MonitorCog className="w-3.5 h-3.5" />
+                <span>Graphics</span>
               </button>
             </div>
           </div>
@@ -191,6 +217,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               ))}
             </>
+          ) : tab === 'graphics' ? (
+            <GraphicsSettingsPanel
+              graphics={graphicsSettings}
+              onSelectPreset={onSelectGraphicsPreset}
+              onUpdateSetting={onUpdateGraphicsSettings}
+              onReset={onResetGraphicsSettings}
+              variant="modal"
+            />
           ) : (
             <div className="space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

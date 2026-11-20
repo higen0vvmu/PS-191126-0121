@@ -89,6 +89,63 @@ export function computeAimDirectionVectorThree(
   return v.normalize();
 }
 
+/**
+ * Computes orthonormal Three.js basis & quaternion for oriented lights (Spot, Area, Linear)
+ * supporting independent Yaw (`aimAzimuthDeg`), Pitch (`aimElevationDeg`), and Roll (`aimRollDeg`),
+ * continuous even at straight-down (-90) and straight-up (+90) pitch.
+ * Note: Three.js `RectAreaLight` emits along local `-Z` with `right = +X`, `up = +Y`.
+ */
+export function computeLightOrientationQuaternionThree(
+  aimAzimuthDeg: number,
+  aimElevationDeg: number,
+  aimRollDeg = 0,
+  mirroredX = false,
+  mirroredY = false
+): {
+  quaternion: THREE.Quaternion;
+  dir: THREE.Vector3;
+  up: THREE.Vector3;
+  right: THREE.Vector3;
+} {
+  const mx = mirroredX ? -1 : 1;
+  const my = mirroredY ? -1 : 1;
+  const dir = computeAimDirectionVectorThree(aimAzimuthDeg, aimElevationDeg, mirroredX, mirroredY);
+  const azRad = (aimAzimuthDeg * Math.PI) / 180;
+
+  let u0: THREE.Vector3;
+  if (Math.hypot(dir.x, dir.z) < 1e-4) {
+    const upSign = dir.y < 0 ? 1 : -1;
+    u0 = new THREE.Vector3(Math.sin(azRad) * upSign * mx, 0, Math.cos(azRad) * upSign * my);
+  } else {
+    u0 = new THREE.Vector3(0, 1, 0).addScaledVector(dir, -dir.y);
+  }
+  if (u0.lengthSq() < 1e-8) {
+    u0 = new THREE.Vector3(0, 0, 1);
+  } else {
+    u0.normalize();
+  }
+
+  // Three.js RectAreaLight shines along local -Z -> zAxis = -dir
+  const zAxis = dir.clone().negate();
+  let xAxis = new THREE.Vector3().crossVectors(u0, zAxis);
+  if (xAxis.lengthSq() < 1e-8) {
+    xAxis = new THREE.Vector3(1, 0, 0);
+  } else {
+    xAxis.normalize();
+  }
+  let yAxis = new THREE.Vector3().crossVectors(zAxis, xAxis).normalize();
+
+  const rollRad = THREE.MathUtils.degToRad((aimRollDeg ?? 0) * (mx * my < 0 ? -1 : 1));
+  if (Math.abs(rollRad) > 1e-6) {
+    xAxis.applyAxisAngle(dir, rollRad).normalize();
+    yAxis.applyAxisAngle(dir, rollRad).normalize();
+  }
+
+  const m = new THREE.Matrix4().makeBasis(xAxis, yAxis, zAxis);
+  const quaternion = new THREE.Quaternion().setFromRotationMatrix(m);
+  return { quaternion, dir, up: yAxis, right: xAxis };
+}
+
 export function computeFurnitureBulbCenterMm(f: Pick<FurnitureInstance, 'parts' | 'templateId' | 'category'>): {
   xMm: number;
   yMm: number;
@@ -163,6 +220,7 @@ export function createDefaultLightSource(
     aimElevationDeg:
       overrides?.aimElevationDeg ??
       (type === 'spot' || type === 'area' || type === 'linear' ? -75 : 0),
+    aimRollDeg: overrides?.aimRollDeg ?? 0,
     coneAngleDeg: overrides?.coneAngleDeg ?? 58,
     penumbra: overrides?.penumbra ?? 0.72,
     widthMm:
@@ -212,6 +270,39 @@ export function deriveLegacyLightsForFurniture(f: FurnitureInstance): FurnitureL
       castShadow: ceilingMounted,
     },
   ];
+}
+
+/**
+ * Determines whether a furniture item is designated as a light object
+ * (either imported with "Is a light" enabled, built-in Lighting category,
+ * or legacy objects carrying configured lights/overrides).
+ */
+export function isFurnitureLightObject(
+  f: Pick<FurnitureInstance, 'isLight' | 'category' | 'lights' | 'glbEmissiveOverrides'>
+): boolean {
+  if (f.isLight === true) return true;
+  if (f.isLight === false) return f.category === 'Lighting';
+  if (f.category === 'Lighting') return true;
+  if (Array.isArray(f.lights) && f.lights.length > 0) return true;
+  if (Array.isArray(f.glbEmissiveOverrides) && f.glbEmissiveOverrides.some((ov) => ov.enabled)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Returns whether the furniture's master "Lit" switch is active.
+ * When false, all lights and emissive emission stay off while preserving user settings.
+ */
+export function isFurnitureLightingActive(
+  f: Pick<FurnitureInstance, 'lightingEnabled' | 'isLight' | 'category' | 'lightConfig' | 'lights'>
+): boolean {
+  if (f.lightingEnabled === false) return false;
+  if (f.lightingEnabled === true) return true;
+  if (f.category === 'Lighting' && f.lightConfig && !Array.isArray(f.lights)) {
+    return f.lightConfig.enabled !== false;
+  }
+  return true;
 }
 
 /**
@@ -452,7 +543,8 @@ export function applyGlbEmissiveOverrides(
   model: THREE.Object3D,
   overrides: GlbMaterialEmissiveOverride[] | undefined,
   nightMix: number,
-  clippingPlanes?: THREE.Plane[]
+  clippingPlanes?: THREE.Plane[],
+  masterLightingEnabled = true
 ): EmissiveTargetEntry[] {
   const overrideMap = new Map<string, GlbMaterialEmissiveOverride>();
   for (const ov of overrides ?? []) {
@@ -468,6 +560,9 @@ export function applyGlbEmissiveOverrides(
   model.traverse((child) => {
     const mesh = child as THREE.Mesh;
     if (!mesh.isMesh) return;
+    if (mesh.geometry && !mesh.geometry.attributes.normal) {
+      mesh.geometry.computeVertexNormals();
+    }
     const isArr = Array.isArray(mesh.material);
     const origMats = isArr ? (mesh.material as THREE.Material[]) : [mesh.material as THREE.Material];
     const nextMats: THREE.Material[] = [];
@@ -489,15 +584,25 @@ export function applyGlbEmissiveOverrides(
         }
         const ov = overrideMap.get(key);
         const std = matClone as THREE.MeshStandardMaterial;
+        if (typeof std.roughness === 'number' && Number.isFinite(std.roughness)) {
+          std.roughness = Math.max(0.04, std.roughness);
+        }
 
-        if (ov && 'emissive' in std) {
+        if (!masterLightingEnabled) {
+          if ('emissive' in std) {
+            std.emissive = new THREE.Color(0x000000);
+            std.emissiveIntensity = 0;
+            std.needsUpdate = true;
+          }
+        } else if (ov && 'emissive' in std) {
           if (ov.enabled) {
             std.emissive = new THREE.Color(ov.emissiveColor || '#FFFFFF');
             if (ov.preserveEmissiveMap === false) {
               std.emissiveMap = null;
             }
-            const baseIntensity = Math.max(0, ov.emissiveIntensity) * Math.max(0.25, ov.bloomBoost ?? 1.25);
-            std.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.88, 1.22, nightMix);
+            const baseIntensity =
+              Math.max(0, ov.emissiveIntensity) * Math.max(0.25, Math.min(1.6, ov.bloomBoost ?? 1.0));
+            std.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.85, 0.94, nightMix);
             std.toneMapped = true;
             std.needsUpdate = true;
             if (!trackedSet.has(std)) {
@@ -517,7 +622,7 @@ export function applyGlbEmissiveOverrides(
           (std.emissiveIntensity ?? 0) > 0.01
         ) {
           const baseIntensity = std.emissiveIntensity;
-          std.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.85, 1.18, nightMix);
+          std.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.85, 0.94, nightMix);
           if (!trackedSet.has(std)) {
             trackedSet.add(std);
             emissiveTargets.push({ mat: std, baseIntensity, alwaysVisible: true });
@@ -550,12 +655,13 @@ export function buildThreeLightsForFurniture(
     useLegacyFillForUnmigratedLamp?: boolean;
   }
 ): SceneBulbLightEntry[] {
+  if (!isFurnitureLightingActive(f)) return [];
   const effectiveLights = resolveEffectiveFurnitureLights(f);
   if (effectiveLights.length === 0) return [];
 
   const mx = f.mirroredX ? -1 : 1;
   const my = f.mirroredY ? -1 : 1;
-  const nightBoost = THREE.MathUtils.lerp(0.26, 1.52, options.nightMix);
+  const nightBoost = THREE.MathUtils.lerp(0.24, 0.62, options.nightMix);
   const ceilingMounted = isCeilingFixture(f) || resolveFurnitureMountingType(f) === 'ceiling';
   const bulbLights: SceneBulbLightEntry[] = [];
 
@@ -639,10 +745,14 @@ export function buildThreeLightsForFurniture(
         const baseIntensity = src.intensity * (src.type === 'linear' ? 2.8 : 2.1);
         const rect = new THREE.RectAreaLight(color, baseIntensity * nightBoost, widthM, heightM);
         rect.position.set(px, py, pz);
-        if (Math.hypot(dir.x, dir.z) < 1e-4) {
-          rect.up.set(0, 0, dir.y < 0 ? 1 : -1);
-        }
-        rect.lookAt(px + dir.x * 2, py + dir.y * 2, pz + dir.z * 2);
+        const basis = computeLightOrientationQuaternionThree(
+          src.aimAzimuthDeg ?? 0,
+          src.aimElevationDeg ?? -75,
+          src.aimRollDeg ?? 0,
+          f.mirroredX,
+          f.mirroredY
+        );
+        rect.quaternion.copy(basis.quaternion);
         rect.name = `Light_${src.id}`;
         tiltGroup.add(rect);
         bulbLights.push({
@@ -698,8 +808,15 @@ export function applyProceduralPartEmissive(
     fallbackLightColor: THREE.Color;
     primaryLightIntensity: number;
     nightMix: number;
+    masterLightingEnabled?: boolean;
   }
 ): EmissiveTargetEntry | null {
+  if (context.masterLightingEnabled === false) {
+    mat.emissive = new THREE.Color(0x000000);
+    mat.emissiveIntensity = 0;
+    return null;
+  }
+
   const ds = part.detailStyle;
   const isAutoLampPart =
     context.isLightingCategory &&
@@ -717,16 +834,16 @@ export function applyProceduralPartEmissive(
 
   if (hasExplicitPartEmissive) {
     const baseIntensity =
-      Math.max(0, part.emissiveIntensity ?? 1.2) * Math.max(0.25, part.bloomBoost ?? 1.2);
+      Math.max(0, part.emissiveIntensity ?? 1.2) * Math.max(0.25, Math.min(1.6, part.bloomBoost ?? 1.0));
     mat.emissive = new THREE.Color(part.emissiveColor || part.color || '#FFBE76');
-    mat.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.85, 1.22, context.nightMix);
+    mat.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.85, 0.94, context.nightMix);
     mat.needsUpdate = true;
     return { mat, baseIntensity, alwaysVisible: true };
   }
 
-  const baseIntensity = 0.08 + 0.56 * context.primaryLightIntensity;
+  const baseIntensity = 0.08 + 0.42 * context.primaryLightIntensity;
   mat.emissive = context.fallbackLightColor.clone();
-  mat.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.45, 1.12, context.nightMix);
+  mat.emissiveIntensity = baseIntensity * THREE.MathUtils.lerp(0.45, 0.85, context.nightMix);
   mat.needsUpdate = true;
   return { mat, baseIntensity, alwaysVisible: false };
 }

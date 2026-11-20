@@ -9,6 +9,7 @@ import {
   buildThreeLightsForFurniture,
   cloneLightsWithFreshIds,
   computeAimDirectionVectorThree,
+  computeLightOrientationQuaternionThree,
   createDefaultLightSource,
   createMatchingLightForGlbMaterial,
   createMatchingLightForPart,
@@ -403,3 +404,35 @@ test('Light sources and GLB emissive overrides survive JSON save/reopen serializ
   assert.equal(f.glbEmissiveOverrides?.[0].enabled, true);
   assert.equal(f.glbEmissiveOverrides?.[0].emissiveIntensity, 2.0);
 });
+
+test('Light orientation basis supports independent Yaw, Pitch, and asymmetric Roll cleanly', () => {
+  // 1. Straight-down Pitch (-90°) maintains smooth horizontal Yaw orientation for Linear/Area lights
+  const yaw0Down = computeLightOrientationQuaternionThree(0, -90, 0, false, false);
+  const yaw90Down = computeLightOrientationQuaternionThree(90, -90, 0, false, false);
+  assert.ok(yaw0Down.dir.y < -0.999);
+  assert.ok(yaw90Down.dir.y < -0.999);
+  assert.ok(Math.abs(yaw0Down.right.x) > 0.99, 'Yaw 0° straight-down width runs along X axis');
+  assert.ok(Math.abs(yaw90Down.right.z) > 0.99, 'Yaw 90° straight-down width rotates 90° to Z axis');
+
+  // 2. Roll rotates local right/up axes around the emission beam without changing beam direction
+  const rolled = computeLightOrientationQuaternionThree(30, -45, 90, false, false);
+  const unrolled = computeLightOrientationQuaternionThree(30, -45, 0, false, false);
+  assert.ok(rolled.dir.distanceTo(unrolled.dir) < 1e-5, 'Roll leaves emission vector unchanged');
+  assert.ok(Math.abs(rolled.right.dot(unrolled.right)) < 1e-4, '90° roll rotates right axis orthogonally');
+
+  // 3. RectAreaLight inside buildThreeLightsForFurniture inherits roll + yaw + pitch quaternion
+  const lin = createDefaultLightSource('linear', {
+    aimAzimuthDeg: 90,
+    aimElevationDeg: -90,
+    aimRollDeg: 45,
+    widthMm: 900,
+    lengthMm: 45,
+  });
+  const furn = makeFurn({ isLight: true, lights: [lin] });
+  const tiltGroup = new THREE.Group();
+  const built = buildThreeLightsForFurniture(furn, tiltGroup, { nightMix: 1, isSoftwareGl: false });
+  assert.equal(built.length, 1);
+  const expected = computeLightOrientationQuaternionThree(90, -90, 45, false, false).quaternion;
+  assert.ok(built[0].light.quaternion.angleTo(expected) < 1e-5);
+});
+

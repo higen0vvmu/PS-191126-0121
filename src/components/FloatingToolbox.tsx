@@ -16,15 +16,18 @@ import {
   Spline,
   Type,
 } from 'lucide-react';
-import { DoorSubtype, EditorTool, Opening, WindowSubtype } from '../types/plan';
+import { DoorSubtype, EditorTool, Opening, RailingStyleId, WindowSubtype } from '../types/plan';
 import { formatKeyLabel, KeybindMap } from '../utils/keybinds';
+import { RAILING_STYLES } from '../utils/railings';
 
 interface FloatingToolboxProps {
   activeTool: EditorTool;
   pendingOpeningSpec: { category: Opening['category']; subtype: Opening['subtype'] };
+  activeRailingStyle: RailingStyleId;
   keybinds: KeybindMap;
   onSelectTool: (tool: EditorTool) => void;
   onSelectOpeningSpec: (spec: { category: Opening['category']; subtype: Opening['subtype'] }) => void;
+  onSelectRailingStyle: (style: RailingStyleId) => void;
 }
 
 const DOOR_SUBTYPES: Array<{ id: DoorSubtype; label: string }> = [
@@ -70,7 +73,17 @@ const ARCH_SUBTYPES: Array<{ id: Opening['subtype']; label: string }> = [
   { id: 'passthrough', label: 'Passthrough' },
 ];
 
-type PopoverGroup = 'wall' | 'door' | 'window' | 'arch' | 'annotate' | null;
+type PopoverGroup = 'wall' | 'door' | 'window' | 'arch' | 'railing' | 'annotate' | null;
+
+const RailingToolIcon: React.FC = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5 shrink-0" aria-hidden="true">
+    <path d="M3 7h18" />
+    <path d="M3 19h18" />
+    <path d="M5 7v12" />
+    <path d="M12 7v12" />
+    <path d="M19 7v12" />
+  </svg>
+);
 
 const KeyBadge: React.FC<{ keyText: string; active?: boolean }> = ({ keyText, active }) => (
   <kbd
@@ -87,9 +100,11 @@ const KeyBadge: React.FC<{ keyText: string; active?: boolean }> = ({ keyText, ac
 export const FloatingToolbox: React.FC<FloatingToolboxProps> = ({
   activeTool,
   pendingOpeningSpec,
+  activeRailingStyle,
   keybinds,
   onSelectTool,
   onSelectOpeningSpec,
+  onSelectRailingStyle,
 }) => {
   const [openMenu, setOpenMenu] = useState<PopoverGroup>(null);
   const dockRef = useRef<HTMLDivElement | null>(null);
@@ -471,6 +486,71 @@ export const FloatingToolbox: React.FC<FloatingToolboxProps> = ({
         <span className="hidden lg:inline">Chimney</span>
         <KeyBadge keyText={formatKeyLabel(keybinds.chimney)} active={activeTool === 'chimney'} />
       </button>
+
+      {/* Railing / Balustrade Multi-Point Path Group */}
+      <div className="relative flex items-center">
+        <button
+          type="button"
+          data-testid="toolbox-railing-btn"
+          title={`Draw Railing (${formatKeyLabel(keybinds.railing)}) — click points or stair edges`}
+          aria-label={`Railing tool (${formatKeyLabel(keybinds.railing)})`}
+          aria-pressed={activeTool === 'railing'}
+          onClick={() => {
+            onSelectTool('railing');
+            setOpenMenu(null);
+          }}
+          className={`${buttonClass(activeTool === 'railing')} rounded-r-none pr-1.5`}
+        >
+          <RailingToolIcon />
+          <span className="hidden lg:inline">Railing</span>
+          <KeyBadge keyText={formatKeyLabel(keybinds.railing)} active={activeTool === 'railing'} />
+        </button>
+        <button
+          type="button"
+          aria-label="Railing style options"
+          aria-haspopup="menu"
+          aria-expanded={openMenu === 'railing'}
+          onClick={() => setOpenMenu((m) => (m === 'railing' ? null : 'railing'))}
+          className={chevronButtonClass(activeTool === 'railing')}
+        >
+          <ChevronUp className="w-3 h-3" />
+        </button>
+
+        {openMenu === 'railing' && (
+          <div
+            role="menu"
+            className="absolute bottom-full left-0 mb-2 w-52 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-xl shadow-xl py-1 text-xs z-40"
+          >
+            <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+              Railing Drawing Style
+            </div>
+            {RAILING_STYLES.map((st) => {
+              const selected = activeRailingStyle === st.id;
+              return (
+                <button
+                  key={st.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={selected}
+                  onClick={() => {
+                    onSelectRailingStyle(st.id);
+                    onSelectTool('railing');
+                    setOpenMenu(null);
+                  }}
+                  className={`w-full px-3 py-1.5 text-left hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer flex items-center justify-between gap-2 ${
+                    selected ? 'font-semibold text-blue-600 dark:text-blue-400' : ''
+                  }`}
+                >
+                  <span className="truncate">{st.label}</span>
+                  {st.id === 'glass_panel' && (
+                    <span className="text-[9px] text-slate-400 shrink-0">Default</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
       <div className="h-5 w-px bg-slate-200 dark:bg-slate-700 mx-0.5 shrink-0" />
 

@@ -131,3 +131,108 @@
   - `RectAreaLight` softens via multi-point fallback when running under software WebGL (`isSoftwareGl === true`) to prevent shader stalls; hardware WebGL uses native `THREE.RectAreaLight`.
   - Browser visual check recommended on an imported emissive GLB (such as IKEA VARMBLIXT) to fine-tune preferred default bloom/intensity aesthetic under Night Mode.
 
+### #5 — Lighting System UI/UX Revision & Night-Time Bloom Correction
+- **Types & State (`src/types/plan.ts`, `src/utils/lighting.ts`, `src/App.tsx`, `src/components/PropertiesInspector.tsx`)**:
+  - Added optional `isLight?: boolean` and `lightingEnabled?: boolean` on `CatalogTemplate` and `FurnitureInstance`, plus `isFurnitureLightObject(f)` and `isFurnitureLightingActive(f)` helpers in `src/utils/lighting.ts`.
+  - Designated non-light GLB imports (`isLight: false`) hide lighting UI in `PropertiesInspector.tsx` and save clean metadata (`isLight`, `lightingEnabled`) into catalog templates and placed instances. Built-in `Lighting` category items and `isLight: true` objects remain light-enabled.
+  - Added master `lightingEnabled` switch behavior across `buildThreeLightsForFurniture`, `applyGlbEmissiveOverrides`, `applyProceduralPartEmissive`, `Viewport3D.tsx`, `furniture3d.ts`, `export3d.ts`, and `Canvas2D.tsx`: toggling **Lit** off disables all associated light sources and emissive emission while preserving user-configured colors, intensities, and offsets cleanly when toggled back on.
+- **Interactive 3D Preview & Unified Lighting Editor (`src/components/InteractiveGlbPreview3D.tsx`, `src/components/UnifiedLightingEditor.tsx`, `src/components/LightingEditorModal.tsx`)**:
+  - Created `InteractiveGlbPreview3D.tsx` with OrbitControls (mouse drag rotation + scroll-wheel zoom), camera reset, and Studio (Day) / Night backdrop toggle — leaving the main project 3D viewport (`Viewport3D.tsx`) strictly view-only.
+  - Selecting a material (GLB) or procedural part in `UnifiedLightingEditor.tsx` highlights matching meshes on the 3D preview in translucent/emissive blue (`#2563EB`/`#3B82F6`) and reveals inline emissive controls (toggle, color picker/swatches, intensity slider, embedded emissive map option, `+ Add Matching Light Here`), alongside light source configuration (`Point`, `Spot`, `Area`, `Linear`) in the same unified panel.
+- **Redesigned GLB Importer & Side Menu Lighting Card (`src/components/ImporterModal.tsx`, `src/components/PropertiesInspector.tsx`)**:
+  - Replaced the GLB drag-and-drop card upon file selection with the interactive 3D preview (`InteractiveGlbPreview3D`) + `Replace File`, **`Is a light`** toggle (OFF by default), and `UnifiedLightingEditor` revealed directly when enabled.
+  - Replaced verbose per-item inline lighting forms in `PropertiesInspector.tsx` with a compact **Lighting** card for light objects showing the **Lit** toggle and **Edit** button side-by-side; clicking **Edit** opens `LightingEditorModal.tsx` with the live 3D preview and unified materials/lights editor.
+- **Night-Time Lighting & Bloom Calibration (`src/components/Viewport3D.tsx`, `src/utils/lighting.ts`, `src/utils/furniture3d.ts`)**:
+  - Reduced excessive night bloom and overexposed light stacking without altering daytime appearance: set `toneMappingExposure` to `lerp(0.96, 0.94, m)`, raised `UnrealBloomPass.threshold` to `lerp(1.38, 1.24, m)` (`> 1.0` so lit walls do not bloom), reduced `bloomPass.strength` to `lerp(0.055, 0.12, m)` and radius to `0.28`, calibrated night point/spot multiplier (`lerp(0.24, 0.62, m)` instead of `1.35`), and softened night emissive multipliers (`0.94`).
+- **UI Polish (`Canvas2D.tsx`, `WallCutThroughViewer.tsx`)**:
+  - Removed emojis (replaced locked labels with `[LOCKED]`) across the UI.
+- **Verification**:
+  - `npx tsx --test src/utils/lighting.test.ts`: **6/6 passing**.
+  - `npm run lint` (`tsc --noEmit`) and `compile_applet` (`npm run build`): verified clean.
+- **Remaining Limitations**:
+  - Procedural emissive parts on objects whose `category !== 'Lighting'` and have no configured lights still glow visually when `lightingEnabled !== false`, while objects marked `isLight: true` (or built-in `Lighting`) expose the **Lit** card and interactive `LightingEditorModal`.
+
+### #6 — 3D Light Position & Direction Gizmo Controls
+- **Types & Orientation Basis (`src/types/plan.ts`, `src/utils/lighting.ts`)**:
+  - Added optional `aimRollDeg?: number` to `FurnitureLightSource` (`-180..180`, default `0`) for asymmetric `'area'` and `'linear'` lights.
+  - Added `computeLightOrientationQuaternionThree(aimAzimuthDeg, aimElevationDeg, aimRollDeg, mirroredX, mirroredY)` in `src/utils/lighting.ts` so `RectAreaLight` and 3D gizmos share one continuous basis across Yaw, Pitch (including straight-down `-90°`/straight-up `+90°`), and Roll.
+- **3D Light Markers & Axis/Orientation Gizmo (`src/components/InteractiveGlbPreview3D.tsx`)**:
+  - Decoupled heavy model/GLB loading from lightweight light/marker/gizmo updates (`lightsOverlayGroupRef`) so dragging gizmo handles updates illumination and markers smoothly at interactive frame rates without reloading meshes.
+  - Rendered visible 2D-matched markers (`#FFFFFF` rim + light-color core + blue selection ring + soft outer halo) at every light's emission point with `depthTest: false` so internal bulbs remain visible inside shades, plus click-to-select hit targets in 3D when multiple lights exist.
+  - Rendered raycasted, camera-plane-projected **3-axis translation arrows** (`X` Red, `Y` Green, `Z` Blue with axis badges) for independent X/Y/Z positioning.
+  - Rendered non-point **Yaw** (amber horizontal ring) and **Pitch** (cyan vertical arc) handles for `'spot'`, `'area'`, and `'linear'` lights, plus a **Roll** (violet ring) handle strictly for asymmetric `'area'`/`'linear'` lights. Point lights show only X/Y/Z translation arrows and zero direction handles.
+- **Synchronized Numeric Controls (`src/components/UnifiedLightingEditor.tsx`, `LightingEditorModal.tsx`, `ImporterModal.tsx`)**:
+  - Synced `selectedLightId` and `onUpdateLight` bi-directionally between `InteractiveGlbPreview3D` and `UnifiedLightingEditor` (clicking a 3D light marker switches the editor to `Light Sources` and selects that light).
+  - Exposed color-matched **X / Y / Z** numeric inputs plus independent **Yaw (°)**, **Pitch (°)**, and asymmetric **Roll (°)** sliders + numeric inputs (hidden on `'point'` lights).
+- **Verification**:
+  - `npx tsx --test src/utils/lighting.test.ts`: **7/7 passing**.
+  - `npm run lint` (`tsc --noEmit`) and `compile_applet` (`npm run build`): verified clean.
+
+### #7 — 3D Viewer Camera-Movement White Flash Fix
+- **Root Causes Identified & Fixed**:
+  1. **Skybox GLSL `pow(0.0, y)` + `HalfFloatType` MSAA `UnrealBloomPass` NaN Explosions (`src/components/Viewport3D.tsx`)**:
+     - The skybox shader evaluated `pow(0.0, 0.55)`, `pow(0.0, 0.7)`, `pow(0.0, 16.0)`, and `pow(0.0, 160.0)` on the anti-sun sky hemisphere and horizon (`NaN` on ANGLE/Metal/Intel/NVIDIA WebGL2 drivers), which spread through `UnrealBloomPass`'s Gaussian mips inside the `HalfFloatType` render target into full-screen white flashes whenever moving the camera.
+     - Fixed by guarding every `pow(...)` input (`max(..., 0.0001)` and `sunAmt > 0.001`), disabling MSAA on the `HalfFloatType` `EffectComposer` target (`samples: 0`), and adding a pre-bloom `ShaderPass` (`hdrSanitizePass`) that clamps `NaN`, negative, and `> 12.0` HDR specular fireflies before `UnrealBloomPass`.
+  2. **GLB Mesh & Roughness Sanitization (`src/utils/lighting.ts`, `src/components/Viewport3D.tsx`, `src/components/InteractiveGlbPreview3D.tsx`)**:
+     - Computed missing vertex normals on imported GLB meshes (`computeVertexNormals()`) and clamped cloned `roughness >= 0.04` to prevent GGX/LTC divide-by-zero specular spikes at grazing camera angles.
+  3. **3D Preview Buffer & Studio Wall Clipping (`src/components/InteractiveGlbPreview3D.tsx`)**:
+     - Enabled `preserveDrawingBuffer: true` and rendered synchronously in `ResizeObserver`, skipped hover state updates while mouse buttons are held during orbit, and removed the near-white vertical `backWall` plane that clipped across the orbit camera path.
+- **Verification**:
+  - `npx tsx --test src/utils/lighting.test.ts`: passing.
+  - `npm run lint` (`tsc --noEmit`) and `compile_applet` (`npm run build`): verified clean.
+
+### #8 — 3D Window Transparency & Non-Rectangular/Cutaway/Export Parity Fix
+- **Root Causes Identified & Fixed**:
+  1. **Overlapping/Touching Window & Non-Rectangular Hole Cutouts (`src/utils/wall3d.ts`)**:
+     - When two openings on the same straight wall overlapped or touched, or when a wide/low `round_arch` (`ow/2 > oh - 0.04`) exited the wall perimeter, `THREE.ExtrudeGeometry` Earcut triangulation failed and filled the window opening back in with solid opaque wall.
+     - Fixed by clustering touching/overlapping cutouts via `buildMergedClusterHolePaths(...)` (2D grid boolean union extracting strictly CW non-intersecting outer loops), clamping `round_arch` rise (`ry = Math.min(ow/2, Math.max(0.02, oh - 0.04))`), fixing `segmental_arch` apex control point, and clamping `applyMiterSkew` corner extensions so thick/acute wall corners cannot fold across adjacent windows.
+  2. **Cutaway-Sliced Window Top Bars (`src/utils/wall3d.ts`, `src/components/Viewport3D.tsx`, `src/utils/export3d.ts`)**:
+     - Cutaway mode previously clamped opening tops `2 cm` below `wallH`, leaving a dark wall-core strip and opaque lintel header across windows sliced by cutaway height.
+     - Fixed by carving top-edge cutaway notches directly into `wallShape`'s outer contour and omitting the `head` frame bar + adjusting glazing bounds when `cutawayEnabled` slices the top of an opening.
+  3. **Curved-Wall Opening Profiles (`src/utils/wall3d.ts`)**:
+     - Added vertical profile evaluation (`getCutoutVerticalSpanAtX`) for `round` windows and `round_arch`/`pointed_arch`/`segmental_arch` openings, preserved exact opening boundary `t` breaks in `baseSteps`, added 14 sub-steps across non-rectangular curved-wall openings, collected multi-cutout vertical spans before `subtractSolidIntervals`, and removed `0.004 m` end-padding on segments touching opening edges.
+  4. **Inner/Outer Wall Alignment, Oval Round Glazing, Glass Material & Export Parity (`src/utils/textures3d.ts`, `src/components/Viewport3D.tsx`, `src/utils/export3d.ts`)**:
+     - Applied `wallOffsets(wall.thicknessMm, wall.alignment)` normal `centerOffsetM` to `opGroup.position` in both `Viewport3D.tsx` and `export3d.ts` so frames and glass sit inside `'inner'` and `'outer'` walls identically to `'center'` walls.
+     - Scaled oval `round` window `disc` glass (`w/(2*r), 1, h/(2*r)`) to match its ring frame, skipped duplicate fixed glass panes behind angled `casement`/`awning` sashes, added missing sills/thresholds/mullions to `export3d.ts`, and tuned `textures3d.ts` `'glass'` material (`metalness: 0`, `opacity: 0.16`, `envMapIntensity: 0.22`, `depthWrite: false`) for clear see-through glazing.
+- **Verification**:
+  - Raycast checks (`wall3d.ts`): 0 opaque wall hits across overlapping windows, cutaway-sliced openings, acute miter corners, `inner`-aligned walls, and straight/curved `round` & arch openings.
+  - `npx tsx --test src/utils/geometry.test.ts`: 42/43 passing (only pre-existing `'sofa_3seat'` failure in test 38).
+  - `npm run lint` (`tsc --noEmit`), `compile_applet` (`npm run build`), and live Playwright 3D screenshot inspection: verified unobstructed transparent windows with 0 page errors.
+
+### #9 — Milestone 4: Advanced 3D Graphics Settings
+- **Graphics Settings Model & Persistence (`src/utils/graphicsSettings.ts`, `src/hooks/usePlanState.ts`)**:
+  - Created `GraphicsSettings`, `GRAPHICS_PRESETS` (`low`, `medium`, `high`, `ultra`), `DEFAULT_GRAPHICS_SETTINGS` (`high`), `applyGraphicsPreset`, `updateGraphicsSetting` (automatically switching `preset` to `'custom'` on any individual override), `normalizeGraphicsSettings`, and device-local persistence under `localStorage` key `'plan_studio_graphics_v1'` (`loadGraphicsSettings`/`saveGraphicsSettings`), keeping user rendering preferences independent from project JSON saves.
+  - Wired `graphicsSettings`, `selectGraphicsPreset`, `updateGraphicsSettings`, and `resetGraphicsSettings` into `usePlanState.ts` and `App.tsx`.
+- **Dual UI Surfaces (`src/components/GraphicsSettingsPanel.tsx`, `src/components/Viewport3D.tsx`, `src/components/SettingsModal.tsx`, `src/components/HomePage.tsx`)**:
+  - Built reusable `GraphicsSettingsPanel.tsx` organized into Preset strip (`Low`, `Medium`, `High`, `Ultra`, auto `Custom` indicator, `Reset`), Display & Performance (`Render Scale`), Lighting & Shadows (`Global Illumination`, `Light Quality`, `Max Lights`, `Shadow Resolution`, `Shadow Softness`, `Shadow Distance`, `Contact Shadows`), Materials & Textures (`Texture Resolution`, `Texture Filtering`, `Anisotropic Filtering`, `Material Quality`, `Reflections`, `Env Map`, `Glass / Alpha`), and Post-Processing (`Anti-Aliasing`, `Ambient Occlusion` + `AO Intensity`, `Bloom Intensity`, `Exposure`, `Contrast`, `Vignette`, optional `Depth of Field` + `Focus Dist` / `Aperture`).
+  - Added **Graphics** button + outside-click/Escape-dismissing popover in `Viewport3D.tsx`'s top bar (solid surface over WebGL canvas, strictly view-only) AND a **Graphics** tab in `SettingsModal.tsx`.
+- **Textures & Material Quality Tiers (`src/utils/textures3d.ts`)**:
+  - Extended `ArchitecturalMaterialOptions` and `getOrCreatePresetTexture` with `textureResolution` (`256`/`512`/`1024`), `textureFiltering` (`nearest`/`bilinear`/`trilinear`), clamped `anisotropyLevel`, `materialQuality` (`standard` vs `physical`), `reflectionQuality` (`off`–`high` scaling `envMapIntensity`/`clearcoat`), and `transparentQuality` (`standard` vs `high`), plus LRU cache eviction (cap `96`, `.dispose()` on eviction). Window glass stays clearly transparent (`opacity: 0.16`, `depthWrite: false`, `DoubleSide`) at every preset.
+- **3D Rendering Pipeline & Performance Scaling (`src/components/Viewport3D.tsx`)**:
+  - Expanded `EffectComposer` chain (`!isSoftwareGl`): `RenderPass` -> `GTAOPass` (toggled & sampled by `ambientOcclusionQuality`) -> `hdrSanitizePass` (WebGL2 NaN clamp preserved) -> `UnrealBloomPass` -> `BokehPass` (optional DoF) -> `SMAAPass` (linear-srgb, pre-`OutputPass`) -> `OutputPass` -> `colorGradePass` (contrast + vignette) -> `FXAA` `ShaderPass` (sRGB, post-`OutputPass`), with synchronized `ResizeObserver` sizing and unmount disposal.
+  - Decoupled lightweight uniform/DPR/GI/shadow-radius/post-processing updates from heavy geometry rebuilds; heavy rebuilds apply shadow map resolution (disposing old shadow targets cleanly), window portal `RectAreaLight` caps (`0`/`4`/`8` by `lightQuality`), interior `PointLight`/`SpotLight`/`RectAreaLight` priority culling (`maxRealtimeLights`) & shadow budget (`0`/`1`/`3`), and grounded floor-furniture contact shadow decals when `contactShadows` is enabled.
+- **Verification**:
+  - `npx tsx --test src/utils/graphicsSettings.test.ts src/utils/lighting.test.ts`: passing.
+  - `npm run lint` (`tsc --noEmit`) and `compile_applet` (`npm run build`): verified clean.
+  - Remaining limitation: Software WebGL (`isSoftwareGl === true`) bypasses `EffectComposer` post-processing and hardware shadows for stability, using direct `renderer.render(...)` and material/texture tier scaling.
+
+### #10 — Milestone 5: Architectural Railings and Balustrades
+- **Types & Parametric Railing Engine (`src/types/plan.ts`, `src/utils/railings.ts`)**:
+  - Added `'railing'` `EditorTool`, `RailingStyleId`, `RailingMountingMethod` (`top_mount`, `side_fascia`, `embedded`, `wall_bracket`), `RailingHandrailShape`, `RailingPostShape`, `RailingGlassTint`, `RailingPathNode` (`{ xMm, yMm, elevationMm }`), `RailingEdgeToggles`, and `RailingConfig` on `ArchElement`.
+  - Implemented all 8 architectural railing styles (`glass_panel` default, `frameless_glass`, `traditional_balusters`, `horizontal_metal`, `cable`, `solid_panel`, `modern_minimalist`, `handrail_only`) with `createDefaultRailingConfig`, `applyRailingStylePreset`, `normalizeRailingConfig`, `resolveRailingConfig`, `recenterRailingNodes`, and `computeRailingPathMetrics`.
+  - Implemented multi-flight staircase spec & continuous landing-to-flight railing path generator (`computeStaircaseGeometrySpec`, `resolveHostStairRailings`) covering `stairs_straight`, `stairs_l`, `stairs_u`, and `stairs_spiral`, perimeter balcony/platform railing resolver (`resolveHostDeckRailings`), host-to-editable conversion (`extractEditableRailingElementsFromHost`), and 2D slope/edge snapping (`snapRailingDrawPoint` with interpolated stair elevation & balcony deck top elevation).
+- **Shared 3D Geometry & Export Parity (`src/utils/railings3d.ts`, `src/components/Viewport3D.tsx`, `src/utils/export3d.ts`)**:
+  - Built `buildRailing3DGroup`, `buildStaircase3DGroup`, and `buildHostDeckRailings3DGroup` handling sloped runs, sheared parallelogram tempered glass/solid infill panels (`depthWrite: false`, `renderOrder: 2` glass transparency/tints/reflections), plumb vertical balusters, tensioned cables, horizontal metal bars, shaped handrails with corner/slope elbow joints, and mounting hardware (`top_mount`, `side_fascia`, `embedded`, `wall_bracket`).
+  - Wired identically into `Viewport3D.tsx` (strictly view-only; passes full `rawH` for staircases) and `export3d.ts` (GLB/GLTF/OBJ/STL).
+- **2D Editor, Catalog, Toolbar & Collapsible Inspector (`src/components/Canvas2D.tsx`, `src/components/FloatingToolbox.tsx`, `src/components/LeftSidebar.tsx`, `src/components/RailingInspectorSection.tsx`, `src/components/PropertiesInspector.tsx`, `src/utils/keybinds.ts`, `src/App.tsx`)**:
+  - Added multi-point `'railing'` path tool (keybind `'l'`) with live snapping to staircases/balconies/railings/walls, double-click/Enter/closed-loop completion, interactive node & `+` midpoint editing handles, multi-flight 2D stair/balcony/railing vector rendering, split Railing button + style selector in `FloatingToolbox.tsx`, all 8 railing presets + U-turn/spiral stairs in `LeftSidebar.tsx`, and collapsible accordions + host stair/balcony controls + *Convert to Editable Railings* in `PropertiesInspector.tsx`.
+- **Verification**:
+  - `npx tsx --test src/utils/railings.test.ts src/utils/graphicsSettings.test.ts src/utils/lighting.test.ts`: 17/17 passing.
+  - `npm run lint` (`tsc --noEmit`), `compile_applet` (`npm run build`), and focused live browser sanity check verified clean.
+  - Remaining limitation: Railing paths are piecewise-linear polylines (`nodes[]` with per-node elevation); smooth curved Bézier railing segments are not yet modeled separately and are approximated by placing closely spaced corner nodes.
+
+
+
+
+
+

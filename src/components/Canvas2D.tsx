@@ -10,6 +10,8 @@ import {
   PersonInstance,
   Point2D,
   ProjectSettings,
+  RailingPathNode,
+  RailingStyleId,
   SelectionTarget,
   Wall,
 } from '../types/plan';
@@ -63,6 +65,8 @@ import {
 } from '../utils/geometry';
 import { getDefaultTileMeters, getEffectiveMaterialHex } from '../data/materials';
 import {
+  isFurnitureLightingActive,
+  isFurnitureLightObject,
   resolveEffectiveFurnitureLights,
   resolveLightSourceHex,
 } from '../utils/lighting';
@@ -77,6 +81,19 @@ import {
   hasCustomView,
   renderFurnitureRepresentationView,
 } from '../utils/svgRepresentationRenderer';
+import {
+  DEFAULT_RAILING_STYLE,
+  buildRailingArchElementFromWorldPoints,
+  computeRailingPathMetrics,
+  computeStaircaseGeometrySpec,
+  localToWorldPoint,
+  recenterRailingNodes,
+  resolveHostDeckRailings,
+  resolveHostStairRailings,
+  resolveRailingConfig,
+  snapRailingDrawPoint,
+  worldToLocalPoint,
+} from '../utils/railings';
 import { formatAreaM2, formatSmartMetric, scaleToBaseZoom, uid } from '../utils/units';
 
 interface Canvas2DProps {
@@ -84,6 +101,7 @@ interface Canvas2DProps {
   settings: ProjectSettings;
   activeTool: EditorTool;
   pendingOpeningSpec: { category: Opening['category']; subtype: Opening['subtype'] };
+  activeRailingStyle?: RailingStyleId;
   selection: SelectionTarget[];
   zoomMultiplier: number;
   fitSignal: number;
@@ -168,6 +186,7 @@ type DragState =
   | { kind: 'curtain'; id: string; offsetMm: Point2D; label: string }
   | { kind: 'person'; id: string; offsetMm: Point2D; label: string }
   | { kind: 'arch'; id: string; offsetMm: Point2D; label: string }
+  | { kind: 'railing_node'; elId: string; nodeIndex: number; label: string }
   | { kind: 'section_end'; end: 'start' | 'end'; label: string }
   | { kind: 'marquee'; startWorld: Point2D; curWorld: Point2D };
 
@@ -176,6 +195,7 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
   settings,
   activeTool,
   pendingOpeningSpec,
+  activeRailingStyle,
   selection,
   zoomMultiplier,
   fitSignal,
@@ -202,6 +222,11 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
 
   // Interactive drawing states
   const [wallDraftPts, setWallDraftPts] = useState<Point2D[]>([]);
+  const [railingDraftPts, setRailingDraftPts] = useState<RailingPathNode[]>([]);
+  const [railingHoverInfo, setRailingHoverInfo] = useState<{
+    elevationMm: number;
+    label?: string;
+  } | null>(null);
   const [typedLengthCm, setTypedLengthCm] = useState<string>('');
   const [centeredAxis, setCenteredAxis] = useState<'x' | 'y'>('x');
   const [alignmentGuides, setAlignmentGuides] = useState<AlignmentGuide[]>([]);
@@ -260,6 +285,8 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
   // Clear transient drafts when switching tools
   useEffect(() => {
     setWallDraftPts([]);
+    setRailingDraftPts([]);
+    setRailingHoverInfo(null);
     setTypedLengthCm('');
     setAlignmentGuides([]);
     setMeasureDraftPts([]);
@@ -450,6 +477,33 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
     [commitWallSegment, onSelect, onToolChange]
   );
 
+  const commitRailingDraft = useCallback(
+    (pts: RailingPathNode[], closed = false) => {
+      if (pts.length < 2) return;
+      const id = uid('rail');
+      const railEl = buildRailingArchElementFromWorldPoints(
+        id,
+        pts,
+        activeRailingStyle ?? DEFAULT_RAILING_STYLE,
+        { closed }
+      );
+      onUpdateLevel(
+        (lvl) => ({
+          ...lvl,
+          archElements: [...lvl.archElements, railEl],
+        }),
+        false,
+        true,
+        'Draw Railing'
+      );
+      onSelect([{ kind: 'arch', id }]);
+      setRailingDraftPts([]);
+      setRailingHoverInfo(null);
+      onToolChange('select');
+    },
+    [activeRailingStyle, onSelect, onToolChange, onUpdateLevel]
+  );
+
   // Keyboard shortcuts for cancelling drawing, numeric wall length input, finishing measurements & spacebar pan
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -494,6 +548,13 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
         }
       }
 
+      if (e.key === 'Backspace' && activeTool === 'railing' && railingDraftPts.length > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        setRailingDraftPts((pts) => pts.slice(0, -1));
+        return;
+      }
+
       if (e.key === 'Escape') {
         if ((activeTool === 'wall' || activeTool === 'wall_arc') && typedLengthCm.length > 0) {
           e.preventDefault();
@@ -502,6 +563,8 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
           return;
         }
         setWallDraftPts([]);
+        setRailingDraftPts([]);
+        setRailingHoverInfo(null);
         setTypedLengthCm('');
         setAlignmentGuides([]);
         setMeasureDraftPts([]);
@@ -511,6 +574,18 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
         onToolChange('select');
       }
       if (e.key === 'Enter') {
+        if (activeTool === 'railing') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (railingDraftPts.length >= 2) {
+            commitRailingDraft(railingDraftPts, false);
+          } else {
+            setRailingDraftPts([]);
+            setRailingHoverInfo(null);
+            onToolChange('select');
+          }
+          return;
+        }
         if (activeTool === 'wall' || activeTool === 'wall_arc') {
           if (typedLengthCm.length > 0) {
             const cm = Number(typedLengthCm);
@@ -556,12 +631,14 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
   }, [
     activeTool,
     wallDraftPts,
+    railingDraftPts,
     typedLengthCm,
     measureDraftPts,
     activeDistanceResult,
     activeAreaResult,
     computeTypedWallEndpoints,
     placeSingleWallAndSelect,
+    commitRailingDraft,
     onToolChange,
   ]);
 
@@ -1022,6 +1099,39 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
       return;
     }
 
+    if (activeTool === 'railing') {
+      const rSnap = snapRailingDrawPoint(rawWorld, {
+        walls: level.walls,
+        archElements: level.archElements,
+        gridSizeMm: settings.gridSizeMm,
+        snapEnabled: settings.snapEnabled,
+        snapThresholdMm: Math.max(snapThreshMm, 170),
+        ceilingHeightMm: level.ceilingHeightMm,
+      });
+      if (
+        railingDraftPts.length >= 3 &&
+        dist(rSnap.point, { x: railingDraftPts[0].xMm, y: railingDraftPts[0].yMm }) <
+          Math.max(120, snapThreshMm * 0.9)
+      ) {
+        commitRailingDraft(railingDraftPts, true);
+        return;
+      }
+      const nextNode: RailingPathNode = {
+        xMm: rSnap.point.x,
+        yMm: rSnap.point.y,
+        elevationMm: rSnap.elevationMm,
+      };
+      if (railingDraftPts.length === 0) {
+        setRailingDraftPts([nextNode]);
+      } else {
+        const prev = railingDraftPts[railingDraftPts.length - 1];
+        if (Math.hypot(nextNode.xMm - prev.xMm, nextNode.yMm - prev.yMm) > 35) {
+          setRailingDraftPts((pts) => [...pts, nextNode]);
+        }
+      }
+      return;
+    }
+
     if (activeTool === 'measure_distance' || activeTool === 'calibrate_trace') {
       const pt = snapped.point;
       if (measureDraftPts.length === 0) {
@@ -1196,14 +1306,40 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
     });
 
     if (dragState?.kind !== 'wall_vertex' && dragState?.kind !== 'furniture') {
-      setHoverWorld(snapped.point);
-      setSnapBadge(snapped.snappedKind);
-      setSnapLabel(snapped.snapLabel);
-      onCursorCoords(snapped.point);
-      if (!dragState && (activeTool === 'wall' || activeTool === 'wall_arc')) {
-        setAlignmentGuides(snapped.guides);
-      } else if (!dragState) {
+      if (activeTool === 'railing' && !dragState) {
+        const rSnap = snapRailingDrawPoint(rawWorld, {
+          walls: level.walls,
+          archElements: level.archElements,
+          gridSizeMm: settings.gridSizeMm,
+          snapEnabled: settings.snapEnabled,
+          snapThresholdMm: Math.max(snapThreshMm, 170),
+          ceilingHeightMm: level.ceilingHeightMm,
+        });
+        setHoverWorld(rSnap.point);
+        setSnapBadge(
+          rSnap.snappedKind === 'railing'
+            ? 'vertex'
+            : rSnap.snappedKind === 'stair_slope' ||
+                rSnap.snappedKind === 'deck_edge' ||
+                rSnap.snappedKind === 'wall'
+              ? 'wall'
+              : rSnap.snappedKind
+        );
+        setSnapLabel(rSnap.snapLabel);
+        setRailingHoverInfo({ elevationMm: rSnap.elevationMm, label: rSnap.snapLabel });
+        onCursorCoords(rSnap.point);
         setAlignmentGuides([]);
+      } else {
+        setHoverWorld(snapped.point);
+        setSnapBadge(snapped.snappedKind);
+        setSnapLabel(snapped.snapLabel);
+        setRailingHoverInfo(null);
+        onCursorCoords(snapped.point);
+        if (!dragState && (activeTool === 'wall' || activeTool === 'wall_arc')) {
+          setAlignmentGuides(snapped.guides);
+        } else if (!dragState) {
+          setAlignmentGuides([]);
+        }
       }
     }
 
@@ -2034,6 +2170,77 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
       return;
     }
 
+    if (dragState.kind === 'railing_node') {
+      const targetEl = level.archElements.find((a) => a.id === dragState.elId);
+      if (!targetEl || targetEl.locked) return;
+      const rSnap = snapRailingDrawPoint(rawWorld, {
+        walls: level.walls,
+        archElements: level.archElements,
+        gridSizeMm: settings.gridSizeMm,
+        snapEnabled: settings.snapEnabled && !e.shiftKey,
+        snapThresholdMm: Math.max(snapThreshMm, 170),
+        ceilingHeightMm: level.ceilingHeightMm,
+        excludeArchId: dragState.elId,
+      });
+      const worldTarget = e.shiftKey ? rawWorld : rSnap.point;
+      setHoverWorld(worldTarget);
+      setSnapBadge(
+        rSnap.snappedKind === 'railing'
+          ? 'vertex'
+          : rSnap.snappedKind === 'stair_slope' ||
+              rSnap.snappedKind === 'deck_edge' ||
+              rSnap.snappedKind === 'wall'
+            ? 'wall'
+            : rSnap.snappedKind
+      );
+      setSnapLabel(rSnap.snapLabel);
+      dragMutatedRef.current = true;
+      onUpdateLevel(
+        (lvl) => ({
+          ...lvl,
+          archElements: lvl.archElements.map((a) => {
+            if (a.id !== dragState.elId || a.locked) return a;
+            const cfg = resolveRailingConfig(a);
+            const localPt = worldToLocalPoint(a.xMm, a.yMm, a.rotationDeg, worldTarget.x, worldTarget.y);
+            const nextNodes = cfg.nodes.map((n, idx) => {
+              if (idx !== dragState.nodeIndex) return n;
+              const useSnapElev =
+                !e.shiftKey &&
+                (rSnap.snappedKind === 'stair_slope' ||
+                  rSnap.snappedKind === 'deck_edge' ||
+                  rSnap.snappedKind === 'railing');
+              return {
+                xMm: Math.round(localPt.x),
+                yMm: Math.round(localPt.y),
+                elevationMm: useSnapElev
+                  ? Math.round(rSnap.elevationMm - a.elevationMm)
+                  : (n.elevationMm ?? 0),
+              };
+            });
+            const rec = recenterRailingNodes(nextNodes, cfg.widthMm);
+            const newOrigin = localToWorldPoint(
+              a.xMm,
+              a.yMm,
+              a.rotationDeg,
+              rec.centerLocal.x,
+              rec.centerLocal.y
+            );
+            return {
+              ...a,
+              xMm: Math.round(newOrigin.x),
+              yMm: Math.round(newOrigin.y),
+              widthMm: rec.widthMm,
+              depthMm: rec.depthMm,
+              railing: { ...cfg, nodes: rec.nodes },
+            };
+          }),
+        }),
+        false,
+        false
+      );
+      return;
+    }
+
     if (dragState.kind === 'section_end') {
       dragMutatedRef.current = true;
       onUpdateLevel(
@@ -2113,6 +2320,10 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
   };
 
   const handleDoubleClick = () => {
+    if (activeTool === 'railing' && railingDraftPts.length >= 2) {
+      commitRailingDraft(railingDraftPts, false);
+      return;
+    }
     if (wallDraftPts.length > 0) {
       setWallDraftPts([]);
       onToolChange('select');
@@ -2950,7 +3161,7 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
               fontWeight={isHovered ? 700 : 600}
               fill={textColor}
             >
-              {opts.locked ? `🔒 ${labelText}` : labelText}
+              {opts.locked ? `[LOCKED] ${labelText}` : labelText}
             </text>
           </g>
           {/* Generous invisible hit area for hovering and clicking */}
@@ -3308,6 +3519,189 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
                       stroke={contourColor}
                       strokeWidth={sw}
                     />
+                  ) : el.type === 'railing' ? (
+                    (() => {
+                      const rCfg = resolveRailingConfig(el);
+                      const metrics = computeRailingPathMetrics(rCfg);
+                      const isGlass = rCfg.style === 'glass_panel' || rCfg.style === 'frameless_glass';
+                      const railStrokeW = Math.max(28, rCfg.handrailWidthMm);
+                      const postColor = isBw ? '#0F172A' : selected ? '#2563EB' : el.color || '#334155';
+                      const railColor = isBw ? '#0F172A' : selected ? '#2563EB' : rCfg.handrailColor ?? el.color ?? '#334155';
+                      const pathD =
+                        rCfg.nodes.length >= 2
+                          ? rCfg.nodes
+                              .map((n, i) => `${i === 0 ? 'M' : 'L'} ${n.xMm} ${n.yMm}`)
+                              .join(' ') + (rCfg.closed && rCfg.nodes.length >= 3 ? ' Z' : '')
+                          : '';
+                      return (
+                        <g>
+                          {/* Wide transparent hit target for reliable selection and dragging */}
+                          {pathD && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke="transparent"
+                              strokeWidth={Math.max(220, rCfg.widthMm + 140)}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          )}
+                          {/* Style-specific infill band */}
+                          {pathD && isGlass && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={isBw ? '#94A3B8' : '#38BDF8'}
+                              strokeOpacity={isBw ? 0.35 : 0.42}
+                              strokeWidth={Math.max(18, rCfg.panelThicknessMm + 16)}
+                              strokeLinejoin="round"
+                            />
+                          )}
+                          {pathD && rCfg.style === 'solid_panel' && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={isBw ? '#CBD5E1' : rCfg.secondaryColor || '#94A3B8'}
+                              strokeWidth={Math.max(24, rCfg.panelThicknessMm + 10)}
+                              strokeLinejoin="round"
+                            />
+                          )}
+                          {pathD && (rCfg.style === 'cable' || rCfg.style === 'horizontal_metal') && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={isBw ? '#475569' : rCfg.secondaryColor || '#64748B'}
+                              strokeWidth={Math.max(8, 1.2 / pxPerMm)}
+                              strokeDasharray={rCfg.style === 'cable' ? '36 24' : undefined}
+                              strokeLinejoin="round"
+                            />
+                          )}
+                          {/* Top handrail cap */}
+                          {pathD && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke={railColor}
+                              strokeOpacity={rCfg.style === 'frameless_glass' ? 0.72 : 0.96}
+                              strokeWidth={railStrokeW}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                            />
+                          )}
+                          {/* Wall standoff ticks for handrail-only */}
+                          {rCfg.style === 'handrail_only' &&
+                            metrics.segments.map((seg) =>
+                              [0.15, 0.5, 0.85].map((t, bIdx) => {
+                                const px = seg.start.xMm + (seg.end.xMm - seg.start.xMm) * t;
+                                const py = seg.start.yMm + (seg.end.yMm - seg.start.yMm) * t;
+                                const dx = seg.end.xMm - seg.start.xMm;
+                                const dy = seg.end.yMm - seg.start.yMm;
+                                const len = Math.hypot(dx, dy) || 1;
+                                const nx = -dy / len;
+                                const ny = dx / len;
+                                return (
+                                  <line
+                                    key={`hb_${seg.index}_${bIdx}`}
+                                    x1={px}
+                                    y1={py}
+                                    x2={px + nx * 42}
+                                    y2={py + ny * 42}
+                                    stroke={isBw ? '#0F172A' : rCfg.accentColor}
+                                    strokeWidth={Math.max(10, 1.4 / pxPerMm)}
+                                  />
+                                );
+                              })
+                            )}
+                          {/* Posts & Balusters along each run */}
+                          {rCfg.style !== 'handrail_only' &&
+                            rCfg.style !== 'frameless_glass' &&
+                            metrics.segments.map((seg) => {
+                              const dx = seg.end.xMm - seg.start.xMm;
+                              const dy = seg.end.yMm - seg.start.yMm;
+                              const segElevA = seg.start.elevationMm ?? 0;
+                              const segElevB = seg.end.elevationMm ?? 0;
+                              const midX = (seg.start.xMm + seg.end.xMm) / 2;
+                              const midY = (seg.start.yMm + seg.end.yMm) / 2;
+                              const angDeg = (Math.atan2(dy, dx) * 180) / Math.PI;
+                              const postHalf = Math.max(18, rCfg.postSizeMm * 0.58);
+                              return (
+                                <g key={`seg_${seg.index}`} className="pointer-events-none">
+                                  {seg.balusterTs.map((bt, bi) => {
+                                    const bx = seg.start.xMm + dx * bt;
+                                    const by = seg.start.yMm + dy * bt;
+                                    return (
+                                      <circle
+                                        key={`b_${bi}`}
+                                        cx={bx}
+                                        cy={by}
+                                        r={Math.max(6, rCfg.balusterSizeMm * 0.45)}
+                                        fill={isBw ? '#0F172A' : rCfg.secondaryColor || postColor}
+                                      />
+                                    );
+                                  })}
+                                  {seg.postTs.map((pt, pi) => {
+                                    const px = seg.start.xMm + dx * pt;
+                                    const py = seg.start.yMm + dy * pt;
+                                    const isEnd = pi === 0 || pi === seg.postTs.length - 1;
+                                    const sHalf = isEnd
+                                      ? Math.max(postHalf, (rCfg.endPostSizeMm ?? rCfg.postSizeMm) * 0.62)
+                                      : postHalf;
+                                    if (rCfg.postShape === 'round') {
+                                      return (
+                                        <circle
+                                          key={`p_${pi}`}
+                                          cx={px}
+                                          cy={py}
+                                          r={sHalf}
+                                          fill="#FFFFFF"
+                                          stroke={postColor}
+                                          strokeWidth={Math.max(10, 1.4 / pxPerMm)}
+                                        />
+                                      );
+                                    }
+                                    return (
+                                      <rect
+                                        key={`p_${pi}`}
+                                        x={px - sHalf}
+                                        y={py - sHalf}
+                                        width={sHalf * 2}
+                                        height={sHalf * 2}
+                                        fill="#FFFFFF"
+                                        stroke={postColor}
+                                        strokeWidth={Math.max(10, 1.4 / pxPerMm)}
+                                      />
+                                    );
+                                  })}
+                                  {Math.abs(segElevB - segElevA) > 15 && seg.planLengthMm > 350 && (
+                                    <g transform={`translate(${midX}, ${midY}) rotate(${segElevB >= segElevA ? angDeg : angDeg + 180})`}>
+                                      <path
+                                        d="M-65 0 H65 M38 -26 L65 0 L38 26"
+                                        fill="none"
+                                        stroke={isBw ? '#0F172A' : '#2563EB'}
+                                        strokeWidth={Math.max(12, 1.6 / pxPerMm)}
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                      />
+                                    </g>
+                                  )}
+                                </g>
+                              );
+                            })}
+                          {selected && pathD && (
+                            <path
+                              d={pathD}
+                              fill="none"
+                              stroke="#2563EB"
+                              strokeWidth={railStrokeW + 24}
+                              strokeOpacity={0.32}
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              className="pointer-events-none"
+                            />
+                          )}
+                        </g>
+                      );
+                    })()
                   ) : el.type === 'doorframe' ? (
                     (() => {
                       const jambW = Math.min(el.widthMm * 0.25, Math.max(45, Math.min(85, el.widthMm * 0.14)));
@@ -3375,6 +3769,130 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
                         </g>
                       );
                     })()
+                  ) : el.type.startsWith('stairs') ? (
+                    (() => {
+                      const stairSpec = computeStaircaseGeometrySpec(el, level.ceilingHeightMm);
+                      const hostRails = resolveHostStairRailings(el, level.ceilingHeightMm);
+                      const stairFill = isBw ? '#F8FAFC' : el.color;
+                      return (
+                        <g>
+                          {/* Hit area */}
+                          <rect
+                            x={-hw}
+                            y={-hd}
+                            width={el.widthMm}
+                            height={el.depthMm}
+                            fill="transparent"
+                          />
+                          {el.type === 'stairs_spiral' && (
+                            <circle
+                              cx={0}
+                              cy={0}
+                              r={Math.min(hw, hd)}
+                              fill={stairFill}
+                              fillOpacity={0.92}
+                              stroke={contourColor}
+                              strokeWidth={sw}
+                            />
+                          )}
+                          {stairSpec.steps.map((st, idx) => {
+                            if (st.wedgeRadiusMm && st.wedgeStartAngleRad !== undefined && st.wedgeSweepRad !== undefined) {
+                              const rOut = st.wedgeRadiusMm;
+                              const rIn = Math.max(85, rOut * 0.16);
+                              const a0 = st.wedgeStartAngleRad;
+                              const a1 = a0 + st.wedgeSweepRad;
+                              const x0 = Math.cos(a0) * rIn;
+                              const y0 = Math.sin(a0) * rIn;
+                              const x1 = Math.cos(a0) * rOut;
+                              const y1 = Math.sin(a0) * rOut;
+                              const x2 = Math.cos(a1) * rOut;
+                              const y2 = Math.sin(a1) * rOut;
+                              const x3 = Math.cos(a1) * rIn;
+                              const y3 = Math.sin(a1) * rIn;
+                              const dAttr = `M ${x0} ${y0} L ${x1} ${y1} A ${rOut} ${rOut} 0 0 ${st.wedgeSweepRad >= 0 ? 1 : 0} ${x2} ${y2} L ${x3} ${y3} Z`;
+                              return (
+                                <path
+                                  key={`step_${idx}`}
+                                  d={dAttr}
+                                  fill={stairFill}
+                                  stroke={isBw ? '#0F172A' : '#475569'}
+                                  strokeWidth={Math.max(6, 0.9 / pxPerMm)}
+                                />
+                              );
+                            }
+                            return (
+                              <g
+                                key={`step_${idx}`}
+                                transform={`translate(${st.centerXMm}, ${st.centerYMm}) rotate(${st.rotationDeg})`}
+                              >
+                                <rect
+                                  x={-st.widthMm / 2}
+                                  y={-st.depthMm / 2}
+                                  width={st.widthMm}
+                                  height={st.depthMm}
+                                  fill={stairFill}
+                                  stroke={st.isLanding ? contourColor : isBw ? '#0F172A' : '#475569'}
+                                  strokeWidth={st.isLanding ? sw : Math.max(6, 0.9 / pxPerMm)}
+                                />
+                              </g>
+                            );
+                          })}
+                          {el.type === 'stairs_spiral' && (
+                            <circle
+                              cx={0}
+                              cy={0}
+                              r={Math.max(80, Math.min(hw, hd) * 0.15)}
+                              fill={isBw ? '#334155' : el.accentColor || '#334155'}
+                              stroke={contourColor}
+                              strokeWidth={sw}
+                            />
+                          )}
+                          {stairSpec.walkLine2D.length >= 2 && (
+                            <polyline
+                              points={stairSpec.walkLine2D.map((p) => `${p.x},${p.y}`).join(' ')}
+                              fill="none"
+                              stroke={isBw ? '#0F172A' : '#2563EB'}
+                              strokeWidth={1.6 / pxPerMm}
+                              markerEnd="url(#arrow_head)"
+                              className="pointer-events-none"
+                            />
+                          )}
+                          {/* Integrated staircase railings in 2D */}
+                          {hostRails.map((hRail, rIdx) => (
+                            <g key={`hrail_${rIdx}`} className="pointer-events-none">
+                              <polyline
+                                points={hRail.nodes.map((n) => `${n.xMm},${n.yMm}`).join(' ')}
+                                fill="none"
+                                stroke={
+                                  hRail.style === 'glass_panel' || hRail.style === 'frameless_glass'
+                                    ? isBw
+                                      ? '#475569'
+                                      : '#0284C7'
+                                    : isBw
+                                      ? '#0F172A'
+                                      : hRail.handrailColor ?? '#334155'
+                                }
+                                strokeWidth={Math.max(24, hRail.handrailWidthMm)}
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeOpacity={0.92}
+                              />
+                              {hRail.nodes.map((n, nIdx) => (
+                                <circle
+                                  key={`hrn_${nIdx}`}
+                                  cx={n.xMm}
+                                  cy={n.yMm}
+                                  r={Math.max(14, hRail.postSizeMm * 0.48)}
+                                  fill="#FFFFFF"
+                                  stroke={isBw ? '#0F172A' : '#334155'}
+                                  strokeWidth={Math.max(8, 1.1 / pxPerMm)}
+                                />
+                              ))}
+                            </g>
+                          ))}
+                        </g>
+                      );
+                    })()
                   ) : (
                     <>
                       <rect
@@ -3388,6 +3906,43 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
                         strokeDasharray={el.type === 'beam' ? '70 50' : undefined}
                         strokeWidth={sw}
                       />
+                      {(el.type === 'balcony' || el.type === 'platform') &&
+                        resolveHostDeckRailings(el).map((dRail, dIdx) => {
+                          const dStr =
+                            dRail.nodes.map((n, i) => `${i === 0 ? 'M' : 'L'} ${n.xMm} ${n.yMm}`).join(' ') +
+                            (dRail.closed && dRail.nodes.length >= 3 ? ' Z' : '');
+                          return (
+                            <g key={`drail_${dIdx}`} className="pointer-events-none">
+                              <path
+                                d={dStr}
+                                fill="none"
+                                stroke={
+                                  dRail.style === 'glass_panel' || dRail.style === 'frameless_glass'
+                                    ? isBw
+                                      ? '#334155'
+                                      : '#0284C7'
+                                    : isBw
+                                      ? '#0F172A'
+                                      : dRail.handrailColor ?? '#334155'
+                                }
+                                strokeWidth={Math.max(26, dRail.handrailWidthMm)}
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                              {dRail.nodes.map((n, nIdx) => (
+                                <circle
+                                  key={`drn_${nIdx}`}
+                                  cx={n.xMm}
+                                  cy={n.yMm}
+                                  r={Math.max(15, dRail.postSizeMm * 0.5)}
+                                  fill="#FFFFFF"
+                                  stroke={isBw ? '#0F172A' : '#334155'}
+                                  strokeWidth={Math.max(8, 1.1 / pxPerMm)}
+                                />
+                              ))}
+                            </g>
+                          );
+                        })}
                       {!isBw && el.type === 'chimney' && (() => {
                         const fc = resolveChimneyFaceColors(el);
                         const bandW = Math.max(18, Math.min(48, Math.min(el.widthMm, el.depthMm) * 0.14));
@@ -3400,33 +3955,6 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
                           </g>
                         );
                       })()}
-                    </>
-                  )}
-                  {el.type.startsWith('stairs') && (
-                    <>
-                      {Array.from({ length: steps }, (_, i) => {
-                        const y = -el.depthMm / 2 + ((i + 1) * el.depthMm) / (steps + 1);
-                        return (
-                          <line
-                            key={i}
-                            x1={-el.widthMm / 2}
-                            y1={y}
-                            x2={el.widthMm / 2}
-                            y2={y}
-                            stroke={isBw ? '#0F172A' : '#475569'}
-                            strokeWidth={0.9 / pxPerMm}
-                          />
-                        );
-                      })}
-                      <line
-                        x1={0}
-                        y1={el.depthMm * 0.4}
-                        x2={0}
-                        y2={-el.depthMm * 0.4}
-                        stroke={isBw ? '#0F172A' : '#2563EB'}
-                        strokeWidth={1.6 / pxPerMm}
-                        markerEnd="url(#arrow_head)"
-                      />
                     </>
                   )}
                 </g>
@@ -3733,16 +4261,17 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
                   )}
 
                   {/* Selected-Only Interactive 2D Light Source Markers & Aim Handles */}
-                  {wholeSelected && (() => {
+                  {wholeSelected && isFurnitureLightObject(f) && (() => {
                     const furnLights = resolveEffectiveFurnitureLights(f);
                     if (furnLights.length === 0) return null;
+                    const masterLit = isFurnitureLightingActive(f);
                     const markerR = 5.5 / pxPerMm;
                     const aimLen = Math.max(190, 26 / pxPerMm);
                     const hitSw = Math.max(10, 1.5 / pxPerMm);
                     return (
-                      <g transform={`scale(${mx}, ${my})`}>
+                      <g transform={`scale(${mx}, ${my})`} opacity={masterLit ? 1 : 0.45}>
                         {furnLights.map((light) => {
-                          const hex = light.enabled ? resolveLightSourceHex(light) : '#94A3B8';
+                          const hex = masterLit && light.enabled ? resolveLightSourceHex(light) : '#94A3B8';
                           const azRad = (light.aimAzimuthDeg * Math.PI) / 180;
                           const dirX = Math.sin(azRad);
                           const dirY = Math.cos(azRad);
@@ -4870,6 +5399,68 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
           )}
 
           {/* 13. Live Rubber-Band Drafting Previews */}
+          {activeTool === 'railing' && railingDraftPts.length > 0 && (
+            <g className="pointer-events-none">
+              <polyline
+                points={[
+                  ...railingDraftPts.map((n) => `${n.xMm},${n.yMm}`),
+                  ...(hoverWorld ? [`${hoverWorld.x},${hoverWorld.y}`] : []),
+                ].join(' ')}
+                fill="none"
+                stroke="#0284C7"
+                strokeWidth={50}
+                strokeOpacity={0.3}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <polyline
+                points={[
+                  ...railingDraftPts.map((n) => `${n.xMm},${n.yMm}`),
+                  ...(hoverWorld ? [`${hoverWorld.x},${hoverWorld.y}`] : []),
+                ].join(' ')}
+                fill="none"
+                stroke="#0284C7"
+                strokeWidth={2 / pxPerMm}
+                strokeDasharray="60 40"
+              />
+              {railingDraftPts.map((pt, i) => (
+                <circle
+                  key={`rdraft_${i}`}
+                  cx={pt.xMm}
+                  cy={pt.yMm}
+                  r={i === 0 && railingDraftPts.length >= 3 ? 9 / pxPerMm : 5.5 / pxPerMm}
+                  fill={i === 0 && railingDraftPts.length >= 3 ? 'rgba(16,185,129,0.28)' : '#0284C7'}
+                  stroke={i === 0 && railingDraftPts.length >= 3 ? '#10B981' : '#FFFFFF'}
+                  strokeWidth={1.6 / pxPerMm}
+                />
+              ))}
+              {hoverWorld && railingDraftPts.length > 0 && (() => {
+                const last = railingDraftPts[railingDraftPts.length - 1];
+                const segLen = Math.hypot(hoverWorld.x - last.xMm, hoverWorld.y - last.yMm);
+                if (segLen < 40) return null;
+                const mx = (last.xMm + hoverWorld.x) / 2;
+                const my = (last.yMm + hoverWorld.y) / 2 - 200;
+                const curElev = railingHoverInfo?.elevationMm ?? 0;
+                const elevText = curElev > 0 ? ` · +${Math.round(curElev / 10)}cm` : '';
+                return (
+                  <g transform={`translate(${mx}, ${my})`}>
+                    <rect x={-520} y={-110} width={1040} height={220} rx={45} fill="#0F172A" />
+                    <text
+                      textAnchor="middle"
+                      dy={45}
+                      fontSize={120}
+                      fontFamily="JetBrains Mono, monospace"
+                      fontWeight={600}
+                      fill="#FFFFFF"
+                    >
+                      {formatSmartMetric(segLen)}
+                      {elevText}
+                    </text>
+                  </g>
+                );
+              })()}
+            </g>
+          )}
           {wallPreview && (
             <g className="pointer-events-none">
               <line
@@ -5415,6 +6006,119 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
               );
             })()}
 
+          {/* Selected Single Railing Interactive Vertex & Midpoint Handles */}
+          {activeTool === 'select' &&
+            selection.length === 1 &&
+            selection[0].kind === 'arch' &&
+            (() => {
+              const selEl = level.archElements.find(
+                (a) => a.id === selection[0].id && a.type === 'railing' && !a.locked
+              );
+              if (!selEl) return null;
+              const rCfg = resolveRailingConfig(selEl);
+              const worldPts = rCfg.nodes.map((n) => ({
+                ...localToWorldPoint(selEl.xMm, selEl.yMm, selEl.rotationDeg, n.xMm, n.yMm),
+                elevationMm: n.elevationMm ?? 0,
+              }));
+              const segCount = rCfg.closed && worldPts.length >= 3 ? worldPts.length : worldPts.length - 1;
+              return (
+                <g data-testid="railing-node-handles">
+                  {Array.from({ length: segCount }, (_, sIdx) => {
+                    const a = worldPts[sIdx];
+                    const b = worldPts[(sIdx + 1) % worldPts.length];
+                    if (Math.hypot(b.x - a.x, b.y - a.y) < 360) return null;
+                    const mx = (a.x + b.x) / 2;
+                    const my = (a.y + b.y) / 2;
+                    return (
+                      <g
+                        key={`mid_${sIdx}`}
+                        transform={`translate(${mx}, ${my})`}
+                        className="cursor-pointer"
+                        onPointerDown={(e) => {
+                          if (e.button !== 0) return;
+                          e.stopPropagation();
+                          const localMid = worldToLocalPoint(selEl.xMm, selEl.yMm, selEl.rotationDeg, mx, my);
+                          const midElev = Math.round(((a.elevationMm ?? 0) + (b.elevationMm ?? 0)) / 2);
+                          const insertAt = sIdx + 1;
+                          const nextNodes = [...rCfg.nodes];
+                          nextNodes.splice(insertAt, 0, {
+                            xMm: Math.round(localMid.x),
+                            yMm: Math.round(localMid.y),
+                            elevationMm: midElev,
+                          });
+                          onUpdateLevel(
+                            (lvl) => ({
+                              ...lvl,
+                              archElements: lvl.archElements.map((x) =>
+                                x.id === selEl.id
+                                  ? { ...x, railing: { ...rCfg, nodes: nextNodes } }
+                                  : x
+                              ),
+                            }),
+                            false,
+                            false
+                          );
+                          dragMutatedRef.current = true;
+                          setDragState({
+                            kind: 'railing_node',
+                            elId: selEl.id,
+                            nodeIndex: insertAt,
+                            label: 'Insert Railing Node',
+                          });
+                        }}
+                      >
+                        <circle
+                          r={5 / pxPerMm}
+                          fill="#FFFFFF"
+                          stroke="#0284C7"
+                          strokeWidth={1.6 / pxPerMm}
+                        />
+                        <line
+                          x1={-2.5 / pxPerMm}
+                          y1={0}
+                          x2={2.5 / pxPerMm}
+                          y2={0}
+                          stroke="#0284C7"
+                          strokeWidth={1.3 / pxPerMm}
+                        />
+                        <line
+                          x1={0}
+                          y1={-2.5 / pxPerMm}
+                          x2={0}
+                          y2={2.5 / pxPerMm}
+                          stroke="#0284C7"
+                          strokeWidth={1.3 / pxPerMm}
+                        />
+                      </g>
+                    );
+                  })}
+                  {worldPts.map((wp, idx) => (
+                    <circle
+                      key={`rnode_${idx}`}
+                      cx={wp.x}
+                      cy={wp.y}
+                      r={6.5 / pxPerMm}
+                      fill="#2563EB"
+                      stroke="#FFFFFF"
+                      strokeWidth={2 / pxPerMm}
+                      className="cursor-grab active:cursor-grabbing"
+                      onPointerDown={(e) => {
+                        if (e.button !== 0) return;
+                        e.stopPropagation();
+                        dragMutatedRef.current = false;
+                        setDragState({
+                          kind: 'railing_node',
+                          elId: selEl.id,
+                          nodeIndex: idx,
+                          label: 'Edit Railing Node',
+                        });
+                      }}
+                    />
+                  ))}
+                </g>
+              );
+            })()}
+
           {/* Marquee Box Select */}
           {dragState?.kind === 'marquee' && (
             <rect
@@ -5794,6 +6498,27 @@ export const Canvas2D: React.FC<Canvas2DProps> = ({
       {activeTool === 'chimney' && (
         <div className="pointer-events-none absolute top-11 right-3 text-xs bg-slate-900 text-white px-3 py-1.5 rounded-md shadow-sm">
           Click near a wall face to attach Chimney flush, or click open floor · Esc cancel
+        </div>
+      )}
+      {activeTool === 'railing' && (
+        <div className="absolute top-11 right-3 z-30 flex items-center gap-2 text-xs bg-slate-900/95 text-white px-3 py-1.5 rounded-md shadow-md border border-slate-700">
+          <span className="pointer-events-none">
+            {railingDraftPts.length === 0
+              ? 'Click corners, stair sides, or balcony edges to start railing · Esc cancel'
+              : `P${railingDraftPts.length} placed · Click next corner · Enter / Double-click finish`}
+            {railingHoverInfo && railingHoverInfo.elevationMm > 0
+              ? ` · Elev +${Math.round(railingHoverInfo.elevationMm / 10)} cm`
+              : ''}
+          </span>
+          {railingDraftPts.length >= 2 && (
+            <button
+              type="button"
+              onClick={() => commitRailingDraft(railingDraftPts, false)}
+              className="px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white font-semibold cursor-pointer"
+            >
+              Finish
+            </button>
+          )}
         </div>
       )}
       {activeTool === 'measure_distance' && !activeDistanceResult && (

@@ -16,6 +16,7 @@ import {
   getEnclosingRoomCeilingMm,
   getWallCenterlinePoint,
   resolveChimneyFaceColors,
+  wallOffsets,
 } from './geometry';
 import {
   resolveFurnitureMountingFace,
@@ -30,9 +31,16 @@ import { buildProceduralFurnitureGroup } from './furniture3d';
 import {
   applyGlbEmissiveOverrides,
   buildThreeLightsForFurniture,
+  isFurnitureLightingActive,
 } from './lighting';
 import { buildDetailedPersonGroup } from './people3d';
 import { buildWall3DGroup } from './wall3d';
+import { resolveRailingConfig } from './railings';
+import {
+  buildHostDeckRailings3DGroup,
+  buildRailing3DGroup,
+  buildStaircase3DGroup,
+} from './railings3d';
 
 export type Export3DFormat = 'glb' | 'gltf' | 'obj' | 'stl';
 
@@ -196,11 +204,17 @@ export async function buildLevelExportGroup(
       const wall = level.walls.find((w) => w.id === op.wallId);
       if (!wall) continue;
 
-      const { point, tangent } = getWallCenterlinePoint(wall, op.t);
+      const { point, tangent, normal } = getWallCenterlinePoint(wall, op.t);
       const angle = Math.atan2(tangent.y, tangent.x);
+      const { left: offL, right: offR } = wallOffsets(wall.thicknessMm, wall.alignment);
+      const centerOffsetM = (offL + offR) / 2000;
       const opGroup = new THREE.Group();
       opGroup.name = `Opening_${op.id}`;
-      opGroup.position.set(point.x / 1000, 0, point.y / 1000);
+      opGroup.position.set(
+        point.x / 1000 + normal.x * centerOffsetM,
+        0,
+        point.y / 1000 + normal.y * centerOffsetM
+      );
       opGroup.rotation.y = -angle;
 
       const w = op.widthMm / 1000;
@@ -208,6 +222,7 @@ export async function buildLevelExportGroup(
         ? Math.min(wall.heightMm, settings.cutawayHeightMm)
         : wall.heightMm;
       const sill = op.sillHeightMm / 1000;
+      const isSlicedTop = settings.cutawayEnabled && op.sillHeightMm + op.heightMm >= maxWallH - 5;
       const h = Math.max(0.05, Math.min(op.heightMm, maxWallH - op.sillHeightMm)) / 1000;
       const thick = wall.thicknessMm / 1000 + 0.02;
       const fThick = op.frameThicknessMm / 1000;
@@ -225,9 +240,12 @@ export async function buildLevelExportGroup(
         jambL.position.set(-w / 2 + fThick / 2, sill + h / 2, 0);
         const jambR = new THREE.Mesh(new THREE.BoxGeometry(fThick, h, thick), frameMat);
         jambR.position.set(w / 2 - fThick / 2, sill + h / 2, 0);
-        const head = new THREE.Mesh(new THREE.BoxGeometry(w, fThick, thick), frameMat);
-        head.position.set(0, sill + h - fThick / 2, 0);
-        opGroup.add(jambL, jambR, head);
+        opGroup.add(jambL, jambR);
+        if (!isSlicedTop) {
+          const head = new THREE.Mesh(new THREE.BoxGeometry(w, fThick, thick), frameMat);
+          head.position.set(0, sill + h - fThick / 2, 0);
+          opGroup.add(head);
+        }
       }
 
       if (op.category === 'window') {
@@ -245,14 +263,74 @@ export async function buildLevelExportGroup(
             glassMat
           );
           disc.rotation.x = Math.PI / 2;
+          disc.scale.set(w / (2 * r), 1, h / (2 * r));
           disc.position.set(0, sill + h / 2, 0);
           opGroup.add(ring, disc);
         } else {
+          const isEuroWindow = op.subtype.startsWith('euro_');
+          const isFullHeightWindow = op.subtype === 'floor_to_ceiling' || op.subtype === 'euro_terrace';
+
+          if (!isFullHeightWindow) {
+            const sillMesh = new THREE.Mesh(new THREE.BoxGeometry(w + 0.04, fThick, thick + 0.04), frameMat);
+            sillMesh.position.set(0, sill + fThick / 2, 0);
+            opGroup.add(sillMesh);
+          } else if (isEuroWindow) {
+            const thresholdMesh = new THREE.Mesh(new THREE.BoxGeometry(w, fThick * 0.7, thick), frameMat);
+            thresholdMesh.position.set(0, sill + (fThick * 0.7) / 2, 0);
+            opGroup.add(thresholdMesh);
+          }
+
           const glassW = Math.max(0.1, w - fThick * 2);
-          const glassH = Math.max(0.1, h - fThick * 2);
-          const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.016), glassMat);
-          glass.position.set(0, sill + h / 2, 0);
-          opGroup.add(glass);
+          const glassH = Math.max(0.1, isSlicedTop ? h - fThick : h - fThick * 2);
+          const glassCenterY = isSlicedTop ? sill + fThick + glassH / 2 : sill + h / 2;
+
+          if (op.subtype !== 'casement' && op.subtype !== 'awning') {
+            const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.016), glassMat);
+            glass.position.set(0, glassCenterY, 0);
+            opGroup.add(glass);
+          }
+
+          if (
+            op.subtype === 'double' ||
+            op.subtype === 'triple' ||
+            op.subtype === 'sliding' ||
+            isEuroWindow
+          ) {
+            const panelCount =
+              op.subtype === 'triple' || op.subtype === 'euro_triple'
+                ? 3
+                : op.subtype === 'double' ||
+                    op.subtype === 'sliding' ||
+                    op.subtype === 'euro_double' ||
+                    op.subtype === 'euro_terrace'
+                  ? 2
+                  : 1;
+            for (let m = 1; m < panelCount; m++) {
+              const mx = -w / 2 + (w * m) / panelCount;
+              const mullion = new THREE.Mesh(
+                new THREE.BoxGeometry(isEuroWindow ? 0.065 : 0.04, glassH, thick * 0.6),
+                frameMat
+              );
+              mullion.position.set(mx, glassCenterY, 0);
+              opGroup.add(mullion);
+            }
+          } else if (op.subtype === 'casement') {
+            const sashPivot = new THREE.Group();
+            sashPivot.position.set(-w / 2 + fThick, sill + h / 2, 0);
+            sashPivot.rotation.y = -0.35;
+            const sash = new THREE.Mesh(new THREE.BoxGeometry(glassW * 0.96, glassH * 0.96, 0.025), glassMat);
+            sash.position.x = glassW / 2;
+            sashPivot.add(sash);
+            opGroup.add(sashPivot);
+          } else if (op.subtype === 'awning') {
+            const sashPivot = new THREE.Group();
+            sashPivot.position.set(0, sill + h - fThick, 0);
+            sashPivot.rotation.x = 0.35;
+            const sash = new THREE.Mesh(new THREE.BoxGeometry(glassW * 0.96, glassH * 0.96, 0.025), glassMat);
+            sash.position.y = -glassH / 2;
+            sashPivot.add(sash);
+            opGroup.add(sashPivot);
+          }
         }
       } else if (op.category === 'door' && op.subtype !== 'doorframe') {
         const panelMat = new THREE.MeshStandardMaterial({
@@ -379,7 +457,13 @@ export async function buildLevelExportGroup(
               mountingType: mType,
               mountingFace: mFace,
             });
-            applyGlbEmissiveOverrides(model, f.glbEmissiveOverrides, 0, clippingPlanes);
+            applyGlbEmissiveOverrides(
+              model,
+              f.glbEmissiveOverrides,
+              0,
+              clippingPlanes,
+              isFurnitureLightingActive(f)
+            );
             mirrorGroup.add(model);
             tiltGroup.position.y = 0;
             if (Math.abs(rxRad) > 1e-4 || Math.abs(ryRad) > 1e-4) {
@@ -479,15 +563,29 @@ export async function buildLevelExportGroup(
         const plinth = new THREE.Mesh(new THREE.BoxGeometry(w * 1.25, 0.12, w * 1.25), accentMat);
         plinth.position.y = 0.06;
         aGroup.add(shaft, plinth);
+      } else if (el.type === 'railing') {
+        const rCfg = resolveRailingConfig(el);
+        aGroup.add(
+          buildRailing3DGroup(rCfg, el.color || '#334155', matOpts, false)
+        );
       } else if (el.type.startsWith('stairs')) {
-        const steps = el.stepCount ?? 14;
-        const treadD = d / steps;
-        const riseH = h / steps;
-        for (let i = 0; i < steps; i++) {
-          const stepMesh = new THREE.Mesh(new THREE.BoxGeometry(w, riseH * 0.9, treadD * 1.04), mat);
-          stepMesh.position.set(0, (i + 0.5) * riseH, d / 2 - (i + 0.5) * treadD);
-          aGroup.add(stepMesh);
-        }
+        aGroup.add(
+          buildStaircase3DGroup(
+            el,
+            targetCeilingMm,
+            rawH / 1000,
+            mat,
+            accentMat,
+            matOpts,
+            false
+          )
+        );
+      } else if (el.type === 'balcony' || el.type === 'platform') {
+        const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+        mesh.position.y = h / 2;
+        aGroup.add(mesh);
+        const deckRails = buildHostDeckRailings3DGroup(el, matOpts, false);
+        if (deckRails) aGroup.add(deckRails);
       } else {
         const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
         mesh.position.y = h / 2;

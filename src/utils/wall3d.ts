@@ -37,6 +37,254 @@ interface WallOpeningCutout {
   y2: number;
   tStart: number;
   tEnd: number;
+  slicedTop: boolean;
+}
+
+function getCutoutVerticalSpanAtX(
+  c: WallOpeningCutout,
+  x: number
+): [number, number] | null {
+  if (x <= c.x1 + 1e-4 || x >= c.x2 - 1e-4) return null;
+  const ow = c.x2 - c.x1;
+  const oh = c.y2 - c.y1;
+  if (ow <= 1e-4 || oh <= 1e-4) return null;
+
+  const cx = (c.x1 + c.x2) / 2;
+  const u = Math.max(-1, Math.min(1, (x - cx) / (ow / 2)));
+
+  if (c.op.category === 'window' && c.op.subtype === 'round') {
+    const halfArcH = (oh / 2) * Math.sqrt(Math.max(0, 1 - u * u));
+    const cy = (c.y1 + c.y2) / 2;
+    const yb = Math.max(c.y1, cy - halfArcH);
+    const yt = Math.min(c.y2, cy + halfArcH);
+    return yt > yb + 0.005 ? [yb, yt] : null;
+  }
+
+  if (c.op.category === 'arch') {
+    if (c.op.subtype === 'round_arch') {
+      const archRise = Math.min(ow / 2, Math.max(0.02, oh - 0.04));
+      const springY = c.y2 - archRise;
+      const topY = Math.min(c.y2, springY + archRise * Math.sqrt(Math.max(0, 1 - u * u)));
+      return topY > c.y1 + 0.005 ? [c.y1, topY] : null;
+    }
+    if (c.op.subtype === 'pointed_arch') {
+      const archRise = Math.min(oh * 0.48, ow * 0.65);
+      const springY = Math.max(c.y1 + 0.04, c.y2 - archRise);
+      const s = Math.abs(u);
+      // Smooth gothic pointed arch approximation matching quadraticCurveTo control at 0.14*ow
+      const tCurve = Math.max(0, Math.min(1, 1 - s));
+      const topY = Math.min(c.y2, springY + (c.y2 - springY) * Math.pow(tCurve, 0.72));
+      return topY > c.y1 + 0.005 ? [c.y1, topY] : null;
+    }
+    if (c.op.subtype === 'segmental_arch') {
+      const archRise = Math.min(oh * 0.25, ow * 0.35);
+      const springY = Math.max(c.y1 + 0.04, c.y2 - archRise);
+      const topY = Math.min(c.y2, springY + (c.y2 - springY) * (1 - u * u));
+      return topY > c.y1 + 0.005 ? [c.y1, topY] : null;
+    }
+  }
+
+  return [c.y1, c.y2];
+}
+
+function isNonRectangularCutout(op: Opening): boolean {
+  return (
+    (op.category === 'window' && op.subtype === 'round') ||
+    (op.category === 'arch' &&
+      (op.subtype === 'round_arch' ||
+        op.subtype === 'pointed_arch' ||
+        op.subtype === 'segmental_arch'))
+  );
+}
+
+function buildExactSingleCutoutPath(c: WallOpeningCutout): THREE.Path {
+  const hole = new THREE.Path();
+  const { x1, x2, y1, y2, op } = c;
+  const ow = x2 - x1;
+  const oh = y2 - y1;
+
+  if (op.category === 'arch' && op.subtype === 'round_arch') {
+    const rx = ow / 2;
+    const ry = Math.min(rx, Math.max(0.02, oh - 0.04));
+    const springY = y2 - ry;
+    hole.moveTo(x1, y1);
+    hole.lineTo(x1, springY);
+    hole.absellipse((x1 + x2) / 2, springY, rx, ry, Math.PI, 0, true, 0);
+    hole.lineTo(x2, y1);
+  } else if (op.category === 'arch' && op.subtype === 'pointed_arch') {
+    const archRise = Math.min(oh * 0.48, ow * 0.65);
+    const springY = Math.max(y1 + 0.04, y2 - archRise);
+    hole.moveTo(x1, y1);
+    hole.lineTo(x1, springY);
+    hole.quadraticCurveTo(x1 + ow * 0.14, y2 - archRise * 0.25, (x1 + x2) / 2, y2);
+    hole.quadraticCurveTo(x2 - ow * 0.14, y2 - archRise * 0.25, x2, springY);
+    hole.lineTo(x2, y1);
+  } else if (op.category === 'arch' && op.subtype === 'segmental_arch') {
+    const archRise = Math.min(oh * 0.25, ow * 0.35);
+    const springY = Math.max(y1 + 0.04, y2 - archRise);
+    hole.moveTo(x1, y1);
+    hole.lineTo(x1, springY);
+    hole.quadraticCurveTo((x1 + x2) / 2, y2 + (y2 - springY), x2, springY);
+    hole.lineTo(x2, y1);
+  } else if (op.category === 'window' && op.subtype === 'round') {
+    const rx = ow / 2;
+    const ry = oh / 2;
+    hole.absellipse((x1 + x2) / 2, (y1 + y2) / 2, rx, ry, 0, Math.PI * 2, true, 0);
+  } else {
+    hole.moveTo(x1, y1);
+    hole.lineTo(x1, y2);
+    hole.lineTo(x2, y2);
+    hole.lineTo(x2, y1);
+  }
+  hole.closePath();
+  return hole;
+}
+
+/**
+ * Computes strictly CW non-intersecting outer boundary loops for a cluster of
+ * overlapping or touching cutouts so Earcut triangulation never fails.
+ */
+function buildMergedClusterHolePaths(cluster: WallOpeningCutout[]): THREE.Path[] {
+  const xSet = new Set<number>();
+  const ySet = new Set<number>();
+
+  for (const c of cluster) {
+    if (isNonRectangularCutout(c.op)) {
+      const steps = 16;
+      for (let i = 0; i <= steps; i++) {
+        const x = c.x1 + ((c.x2 - c.x1) * i) / steps;
+        xSet.add(Number(x.toFixed(5)));
+        const span = getCutoutVerticalSpanAtX(c, Math.min(c.x2 - 1e-4, Math.max(c.x1 + 1e-4, x)));
+        if (span) {
+          ySet.add(Number(span[0].toFixed(5)));
+          ySet.add(Number(span[1].toFixed(5)));
+        }
+      }
+    } else {
+      xSet.add(Number(c.x1.toFixed(5)));
+      xSet.add(Number(c.x2.toFixed(5)));
+      ySet.add(Number(c.y1.toFixed(5)));
+      ySet.add(Number(c.y2.toFixed(5)));
+    }
+  }
+
+  const xs = Array.from(xSet).sort((a, b) => a - b);
+  const ys = Array.from(ySet).sort((a, b) => a - b);
+  if (xs.length < 2 || ys.length < 2) return [];
+
+  const nx = xs.length - 1;
+  const ny = ys.length - 1;
+  const filled: boolean[][] = Array.from({ length: nx }, () => new Array<boolean>(ny).fill(false));
+
+  for (let ix = 0; ix < nx; ix++) {
+    const mx = (xs[ix] + xs[ix + 1]) / 2;
+    const spans: Array<[number, number]> = [];
+    for (const c of cluster) {
+      const s = getCutoutVerticalSpanAtX(c, mx);
+      if (s) spans.push(s);
+    }
+    if (spans.length === 0) continue;
+    for (let iy = 0; iy < ny; iy++) {
+      const my = (ys[iy] + ys[iy + 1]) / 2;
+      if (spans.some(([yb, yt]) => my >= yb && my <= yt)) {
+        filled[ix][iy] = true;
+      }
+    }
+  }
+
+  // Extract directed boundary edges on the grid keeping filled area on the right (CW hole winding)
+  interface Edge {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+    used: boolean;
+  }
+  const edges: Edge[] = [];
+  const keyOf = (x: number, y: number) => `${x.toFixed(5)},${y.toFixed(5)}`;
+
+  for (let ix = 0; ix < nx; ix++) {
+    for (let iy = 0; iy < ny; iy++) {
+      if (!filled[ix][iy]) continue;
+      const xL = xs[ix];
+      const xR = xs[ix + 1];
+      const yB = ys[iy];
+      const yT = ys[iy + 1];
+      if (ix === 0 || !filled[ix - 1][iy]) {
+        edges.push({ x0: xL, y0: yB, x1: xL, y1: yT, used: false });
+      }
+      if (iy === ny - 1 || !filled[ix][iy + 1]) {
+        edges.push({ x0: xL, y0: yT, x1: xR, y1: yT, used: false });
+      }
+      if (ix === nx - 1 || !filled[ix + 1][iy]) {
+        edges.push({ x0: xR, y0: yT, x1: xR, y1: yB, used: false });
+      }
+      if (iy === 0 || !filled[ix][iy - 1]) {
+        edges.push({ x0: xR, y0: yB, x1: xL, y1: yB, used: false });
+      }
+    }
+  }
+
+  const outMap = new Map<string, Edge[]>();
+  for (const e of edges) {
+    const k = keyOf(e.x0, e.y0);
+    const list = outMap.get(k);
+    if (list) list.push(e);
+    else outMap.set(k, [e]);
+  }
+
+  const paths: THREE.Path[] = [];
+  for (const startEdge of edges) {
+    if (startEdge.used) continue;
+    const pts: Array<{ x: number; y: number }> = [];
+    let cur: Edge | undefined = startEdge;
+    while (cur && !cur.used) {
+      cur.used = true;
+      pts.push({ x: cur.x0, y: cur.y0 });
+      const nextList: Edge[] = outMap.get(keyOf(cur.x1, cur.y1)) ?? [];
+      const curDx: number = cur.x1 - cur.x0;
+      const curDy: number = cur.y1 - cur.y0;
+      // Prefer straight continuation or right-turn to keep outer hole loop simple
+      let chosen: Edge | undefined = nextList.find(
+        (n) => !n.used && Math.abs((n.x1 - n.x0) * curDy - (n.y1 - n.y0) * curDx) < 1e-6
+      );
+      if (!chosen) chosen = nextList.find((n) => !n.used);
+      cur = chosen;
+    }
+    if (pts.length < 3) continue;
+
+    // Simplify collinear vertices
+    const simplified: Array<{ x: number; y: number }> = [];
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i - 1 + pts.length) % pts.length];
+      const curr = pts[i];
+      const next = pts[(i + 1) % pts.length];
+      const cross = (curr.x - prev.x) * (next.y - curr.y) - (curr.y - prev.y) * (next.x - curr.x);
+      if (Math.abs(cross) > 1e-7) {
+        simplified.push(curr);
+      }
+    }
+    if (simplified.length < 3) continue;
+
+    let signedArea = 0;
+    for (let i = 0; i < simplified.length; i++) {
+      const a = simplified[i];
+      const b = simplified[(i + 1) % simplified.length];
+      signedArea += a.x * b.y - b.x * a.y;
+    }
+    // Outer cutout loops have negative signedArea (CW). Positive loops would be solid islands.
+    if (signedArea >= -1e-6) continue;
+
+    const p = new THREE.Path();
+    p.moveTo(simplified[0].x, simplified[0].y);
+    for (let i = 1; i < simplified.length; i++) {
+      p.lineTo(simplified[i].x, simplified[i].y);
+    }
+    p.closePath();
+    paths.push(p);
+  }
+
+  return paths;
 }
 
 function subtractSolidIntervals(
@@ -200,8 +448,10 @@ export function buildWall3DGroup(
       const hw = Math.min(arcLenM * 0.48, op.widthMm / 2000);
       const x1 = Math.max(0.02, cx - hw);
       const x2 = Math.min(arcLenM - 0.02, cx + hw);
+      const rawTop = (op.sillHeightMm + op.heightMm) / 1000;
+      const slicedTop = opts.cutawayEnabled && rawTop >= wallH - 0.005;
       const y1 = Math.max(0.001, op.sillHeightMm / 1000);
-      const y2 = Math.min(wallH - 0.02, (op.sillHeightMm + op.heightMm) / 1000);
+      const y2 = slicedTop ? wallH : Math.min(wallH - 0.015, rawTop);
       if (x2 > x1 + 0.04 && y2 > y1 + 0.04) {
         cutouts.push({
           op,
@@ -211,26 +461,39 @@ export function buildWall3DGroup(
           y2,
           tStart: x1 / arcLenM,
           tEnd: x2 / arcLenM,
+          slicedTop,
         });
       }
     }
 
     const baseSteps = 28;
-    const tBreaks = new Set<number>();
-    for (let i = 0; i <= baseSteps; i++) tBreaks.add(i / baseSteps);
+    const priorityBreaks: number[] = [0, 1];
     for (const c of cutouts) {
-      tBreaks.add(Math.max(0, Math.min(1, c.tStart)));
-      tBreaks.add(Math.max(0, Math.min(1, c.tEnd)));
-    }
-    const sortedTs = Array.from(tBreaks).sort((a, b) => a - b);
-    const ts: number[] = [];
-    for (const t of sortedTs) {
-      if (ts.length === 0 || t - ts[ts.length - 1] > 0.0015) {
-        ts.push(t);
-      } else if (t === 1) {
-        ts[ts.length - 1] = 1;
+      const tsC0 = Math.max(0, Math.min(1, c.tStart));
+      const tsC1 = Math.max(0, Math.min(1, c.tEnd));
+      priorityBreaks.push(tsC0, tsC1);
+      if (isNonRectangularCutout(c.op)) {
+        const arcSubSteps = 14;
+        for (let k = 1; k < arcSubSteps; k++) {
+          priorityBreaks.push(tsC0 + ((tsC1 - tsC0) * k) / arcSubSteps);
+        }
       }
     }
+    const baseBreaks: number[] = [];
+    for (let i = 1; i < baseSteps; i++) {
+      const t = i / baseSteps;
+      if (!priorityBreaks.some((p) => Math.abs(p - t) < 0.002)) {
+        baseBreaks.push(t);
+      }
+    }
+    const sortedTs = [...priorityBreaks, ...baseBreaks].sort((a, b) => a - b);
+    const ts: number[] = [];
+    for (const t of sortedTs) {
+      if (ts.length === 0 || t - ts[ts.length - 1] > 0.0005) {
+        ts.push(t);
+      }
+    }
+    if (ts.length > 0 && ts[ts.length - 1] < 0.9999) ts.push(1);
 
     const curvedMats = [opts.coreMat, opts.coreMat, opts.coreMat, opts.coreMat, leftMat, rightMat];
     const bbH = wall.hasBaseboard && wall.baseboardHeightMm > 0 ? Math.min(wallH, wall.baseboardHeightMm / 1000) : 0;
@@ -254,35 +517,40 @@ export function buildWall3DGroup(
       const segDx = p2x - p1x;
       const segDz = p2z - p1z;
       const segLen = Math.hypot(segDx, segDz);
-      if (segLen < 0.008) continue;
+      if (segLen < 0.004) continue;
       const ang = Math.atan2(segDz, segDx);
       const midX = (p1x + p2x) / 2;
       const midZ = (p1z + p2z) / 2;
 
-      const hit = cutouts.find((c) => tMid > c.tStart + 0.0005 && tMid < c.tEnd - 0.0005);
-      let verticalSpans: Array<[number, number]> = [[0, wallH]];
-      let holeBottom = Infinity;
-      let holeTop = -Infinity;
-
-      if (hit) {
-        holeBottom = hit.y1;
-        holeTop = hit.y2;
-        if (hit.op.category === 'window' && hit.op.subtype === 'round') {
-          const tMidNorm = (tMid - (hit.tStart + hit.tEnd) / 2) / Math.max(1e-4, (hit.tEnd - hit.tStart) / 2);
-          const halfArcH = ((hit.y2 - hit.y1) / 2) * Math.sqrt(Math.max(0, 1 - tMidNorm * tMidNorm));
-          const cy = (hit.y1 + hit.y2) / 2;
-          holeBottom = cy - halfArcH;
-          holeTop = cy + halfArcH;
+      const xMid = tMid * arcLenM;
+      const blockedSpans: Array<[number, number]> = [];
+      let minHoleBottom = Infinity;
+      let maxHoleTop = -Infinity;
+      for (const c of cutouts) {
+        const span = getCutoutVerticalSpanAtX(c, xMid);
+        if (span) {
+          blockedSpans.push(span);
+          minHoleBottom = Math.min(minHoleBottom, span[0]);
+          maxHoleTop = Math.max(maxHoleTop, span[1]);
         }
-        verticalSpans = [];
-        if (holeBottom > 0.008) verticalSpans.push([0, holeBottom]);
-        if (holeTop < wallH - 0.008) verticalSpans.push([holeTop, wallH]);
       }
+
+      const verticalSpans =
+        blockedSpans.length > 0 ? subtractSolidIntervals(wallH, blockedSpans) : ([[0, wallH]] as Array<[number, number]>);
+
+      const touchesOpeningEdge = cutouts.some(
+        (c) =>
+          Math.abs(t0 - c.tStart) < 0.001 ||
+          Math.abs(t0 - c.tEnd) < 0.001 ||
+          Math.abs(t1 - c.tStart) < 0.001 ||
+          Math.abs(t1 - c.tEnd) < 0.001
+      );
+      const padLen = touchesOpeningEdge ? 0 : 0.004;
 
       for (const [yA, yB] of verticalSpans) {
         const spanH = yB - yA;
         if (spanH < 0.008) continue;
-        const segGeo = new THREE.BoxGeometry(segLen + 0.006, spanH, thick);
+        const segGeo = new THREE.BoxGeometry(segLen + padLen, spanH, thick);
         opts.onCurvedSegmentGeo?.(segGeo, i);
         const segMesh = new THREE.Mesh(segGeo, curvedMats);
         segMesh.position.set(midX, (yA + yB) / 2, midZ);
@@ -292,15 +560,15 @@ export function buildWall3DGroup(
         wallGroup.add(segMesh);
       }
 
-      if (bbH > 0 && opts.baseboardMat && (!hit || holeBottom >= bbH + 0.002)) {
-        const bbSeg = new THREE.Mesh(new THREE.BoxGeometry(segLen + 0.006, bbH, thick + 0.018), opts.baseboardMat);
+      if (bbH > 0 && opts.baseboardMat && (blockedSpans.length === 0 || minHoleBottom >= bbH + 0.002)) {
+        const bbSeg = new THREE.Mesh(new THREE.BoxGeometry(segLen + padLen, bbH, thick + 0.018), opts.baseboardMat);
         bbSeg.position.set(midX, bbH / 2, midZ);
         bbSeg.rotation.y = -ang;
         bbSeg.receiveShadow = opts.castShadows;
         wallGroup.add(bbSeg);
       }
-      if (crH > 0 && opts.crownMat && (!hit || holeTop <= wallH - crH - 0.002)) {
-        const crSeg = new THREE.Mesh(new THREE.BoxGeometry(segLen + 0.006, crH, thick + 0.025), opts.crownMat);
+      if (crH > 0 && opts.crownMat && (blockedSpans.length === 0 || maxHoleTop <= wallH - crH - 0.002)) {
+        const crSeg = new THREE.Mesh(new THREE.BoxGeometry(segLen + padLen, crH, thick + 0.025), opts.crownMat);
         crSeg.position.set(midX, wallH - crH / 2, midZ);
         crSeg.rotation.y = -ang;
         wallGroup.add(crSeg);
@@ -370,62 +638,114 @@ export function buildWall3DGroup(
   wallWrapper.position.set(wall.start.x / 1000, 0, wall.start.y / 1000);
   wallWrapper.rotation.y = -angle;
 
-  // Outer perimeter (CCW) + Cutout holes (strictly CW winding)
-  const wallShape = new THREE.Shape();
-  wallShape.moveTo(0, 0);
-  wallShape.lineTo(len, 0);
-  wallShape.lineTo(len, wallH);
-  wallShape.lineTo(0, wallH);
-  wallShape.closePath();
-
   const cutouts: WallOpeningCutout[] = [];
   for (const op of hostOpenings) {
     const cx = op.t * len;
     const hw = Math.min(len * 0.48, op.widthMm / 2000);
     const x1 = Math.max(0.02, cx - hw);
     const x2 = Math.min(len - 0.02, cx + hw);
+    const rawTop = (op.sillHeightMm + op.heightMm) / 1000;
+    const slicedTop = opts.cutawayEnabled && rawTop >= wallH - 0.005;
     const y1 = Math.max(0.001, op.sillHeightMm / 1000);
-    const y2 = Math.min(wallH - 0.02, (op.sillHeightMm + op.heightMm) / 1000);
+    const y2 = slicedTop ? wallH : Math.min(wallH - 0.015, rawTop);
     if (x2 > x1 + 0.04 && y2 > y1 + 0.04) {
-      cutouts.push({ op, x1, x2, y1, y2, tStart: x1 / len, tEnd: x2 / len });
-      const hole = new THREE.Path();
-      const ow = x2 - x1;
-      const oh = y2 - y1;
-      if (op.category === 'arch' && op.subtype === 'round_arch') {
-        const radius = ow / 2;
-        const springY = Math.max(y1 + 0.05, y2 - radius);
-        hole.moveTo(x1, y1);
-        hole.lineTo(x1, springY);
-        hole.absarc((x1 + x2) / 2, springY, radius, Math.PI, 0, true);
-        hole.lineTo(x2, y1);
-      } else if (op.category === 'arch' && op.subtype === 'pointed_arch') {
-        const archRise = Math.min(oh * 0.48, ow * 0.65);
-        const springY = Math.max(y1 + 0.05, y2 - archRise);
-        hole.moveTo(x1, y1);
-        hole.lineTo(x1, springY);
-        hole.quadraticCurveTo(x1 + ow * 0.14, y2 - archRise * 0.25, (x1 + x2) / 2, y2);
-        hole.quadraticCurveTo(x2 - ow * 0.14, y2 - archRise * 0.25, x2, springY);
-        hole.lineTo(x2, y1);
-      } else if (op.category === 'arch' && op.subtype === 'segmental_arch') {
-        const archRise = Math.min(oh * 0.25, ow * 0.35);
-        const springY = Math.max(y1 + 0.05, y2 - archRise);
-        hole.moveTo(x1, y1);
-        hole.lineTo(x1, springY);
-        hole.quadraticCurveTo((x1 + x2) / 2, y2 + archRise * 0.55, x2, springY);
-        hole.lineTo(x2, y1);
-      } else if (op.category === 'window' && op.subtype === 'round') {
-        const rx = ow / 2;
-        const ry = oh / 2;
-        hole.absellipse((x1 + x2) / 2, (y1 + y2) / 2, rx, ry, 0, Math.PI * 2, true, 0);
+      cutouts.push({ op, x1, x2, y1, y2, tStart: x1 / len, tEnd: x2 / len, slicedTop });
+    }
+  }
+
+  // Clamp miter extensions so acute corner miters never fold across an opening cutout
+  if (cutouts.length > 0) {
+    const minCutX = Math.min(...cutouts.map((c) => c.x1)) - 0.004;
+    const maxCutX = Math.max(...cutouts.map((c) => c.x2)) + 0.004;
+    uStartL = Math.min(uStartL, minCutX);
+    uStartR = Math.min(uStartR, minCutX);
+    uEndL = Math.max(uEndL, maxCutX);
+    uEndR = Math.max(uEndR, maxCutX);
+  }
+
+  // Separate top-edge cutaway notches (which dip the top outer wall contour) from enclosed holes
+  const topNotches = cutouts.filter((c) => c.slicedTop);
+  const enclosedCutouts = cutouts.filter((c) => !c.slicedTop);
+
+  // Outer perimeter (CCW), dipping down across any cutaway-sliced openings so no lintel bar blocks them
+  const wallShape = new THREE.Shape();
+  wallShape.moveTo(0, 0);
+  wallShape.lineTo(len, 0);
+  wallShape.lineTo(len, wallH);
+
+  if (topNotches.length === 0) {
+    wallShape.lineTo(0, wallH);
+  } else {
+    const notchIntervals: Array<[number, number]> = topNotches.map((n) => [n.x1, n.x2]);
+    const solidTopSpans = subtractSolidIntervals(len, notchIntervals);
+    // Walk top edge right-to-left (x = len -> x = 0)
+    const notchBounds: Array<{ x1: number; x2: number }> = [];
+    let cur = 0;
+    const sortedNotches = [...notchIntervals].sort((a, b) => a[0] - b[0]);
+    for (const [a, b] of sortedNotches) {
+      if (notchBounds.length === 0 || a > notchBounds[notchBounds.length - 1].x2 + 0.002) {
+        notchBounds.push({ x1: a, x2: b });
       } else {
-        // Explicit CW winding for rectangular cutouts so inner holes stay strictly open
-        hole.moveTo(x1, y1);
-        hole.lineTo(x1, y2);
-        hole.lineTo(x2, y2);
-        hole.lineTo(x2, y1);
+        notchBounds[notchBounds.length - 1].x2 = Math.max(notchBounds[notchBounds.length - 1].x2, b);
       }
-      hole.closePath();
-      wallShape.holes.push(hole);
+      cur = Math.max(cur, b);
+    }
+    void solidTopSpans;
+    for (let i = notchBounds.length - 1; i >= 0; i--) {
+      const nb = notchBounds[i];
+      wallShape.lineTo(nb.x2, wallH);
+      // Sample bottom profile across [nb.x2 -> nb.x1] (supports round/curved bottoms when cutaway slices mid-circle)
+      const subSteps = 10;
+      for (let s = 0; s <= subSteps; s++) {
+        const sx = nb.x2 - ((nb.x2 - nb.x1) * s) / subSteps;
+        const probeX = Math.min(nb.x2 - 1e-4, Math.max(nb.x1 + 1e-4, sx));
+        let floorY = wallH;
+        for (const n of topNotches) {
+          const sp = getCutoutVerticalSpanAtX(n, probeX);
+          if (sp) floorY = Math.min(floorY, sp[0]);
+        }
+        wallShape.lineTo(sx, Math.max(0.001, Math.min(wallH - 0.01, floorY)));
+      }
+      wallShape.lineTo(nb.x1, wallH);
+    }
+    wallShape.lineTo(0, wallH);
+  }
+  wallShape.closePath();
+
+  // Cluster overlapping or touching enclosed holes so Earcut never receives intersecting hole paths
+  const visited = new Array<boolean>(enclosedCutouts.length).fill(false);
+  const clusters: WallOpeningCutout[][] = [];
+  const holesTouchOrOverlap = (a: WallOpeningCutout, b: WallOpeningCutout) =>
+    a.x1 <= b.x2 + 0.003 &&
+    b.x1 <= a.x2 + 0.003 &&
+    a.y1 <= b.y2 + 0.003 &&
+    b.y1 <= a.y2 + 0.003;
+
+  for (let i = 0; i < enclosedCutouts.length; i++) {
+    if (visited[i]) continue;
+    visited[i] = true;
+    const cluster: WallOpeningCutout[] = [enclosedCutouts[i]];
+    const queue = [enclosedCutouts[i]];
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      for (let j = 0; j < enclosedCutouts.length; j++) {
+        if (!visited[j] && holesTouchOrOverlap(curr, enclosedCutouts[j])) {
+          visited[j] = true;
+          cluster.push(enclosedCutouts[j]);
+          queue.push(enclosedCutouts[j]);
+        }
+      }
+    }
+    clusters.push(cluster);
+  }
+
+  for (const cluster of clusters) {
+    if (cluster.length === 1) {
+      wallShape.holes.push(buildExactSingleCutoutPath(cluster[0]));
+    } else {
+      for (const path of buildMergedClusterHolePaths(cluster)) {
+        wallShape.holes.push(path);
+      }
     }
   }
 

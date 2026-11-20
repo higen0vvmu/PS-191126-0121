@@ -28,6 +28,15 @@ import {
   KeybindMap,
   normalizeKeybindMap,
 } from '../utils/keybinds';
+import {
+  applyGraphicsPreset,
+  ConcreteGraphicsPresetId,
+  DEFAULT_GRAPHICS_SETTINGS,
+  GraphicsSettings,
+  loadGraphicsSettings,
+  saveGraphicsSettings,
+  updateGraphicsSetting,
+} from '../utils/graphicsSettings';
 import { hydrateProjectAssets, stripInlineGlbForStorage } from '../utils/assetStore';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -258,6 +267,7 @@ export function usePlanState() {
   const previewProjectRef = useRef<Project | null>(null);
   const project = previewProject ?? history.entries[history.index].project;
   const [keybinds, setKeybindsState] = useState<KeybindMap>(() => loadSavedKeybinds());
+  const [graphicsSettings, setGraphicsSettings] = useState<GraphicsSettings>(() => loadGraphicsSettings());
   const [selection, setSelection] = useState<SelectionTarget[]>([]);
   const [clipboard, setClipboard] = useState<{
     furniture: FurnitureInstance[];
@@ -319,6 +329,10 @@ export function usePlanState() {
       // ignore
     }
   }, [keybinds]);
+
+  useEffect(() => {
+    saveGraphicsSettings(graphicsSettings);
+  }, [graphicsSettings]);
 
   // Helper to make authenticated API calls to PostgreSQL backend
   const authedFetch = useCallback(
@@ -437,6 +451,18 @@ export function usePlanState() {
     },
     [user, authedFetch]
   );
+
+  const selectGraphicsPreset = useCallback((presetId: ConcreteGraphicsPresetId) => {
+    setGraphicsSettings(applyGraphicsPreset(presetId));
+  }, []);
+
+  const updateGraphicsSettings = useCallback((partial: Partial<GraphicsSettings>) => {
+    setGraphicsSettings((prev) => updateGraphicsSetting(prev, partial));
+  }, []);
+
+  const resetGraphicsSettings = useCallback(() => {
+    setGraphicsSettings({ ...DEFAULT_GRAPHICS_SETTINGS });
+  }, []);
 
   const activeLevel: Level =
     project.levels.find((l) => l.id === project.activeLevelId) ?? project.levels[0];
@@ -1185,6 +1211,10 @@ export function usePlanState() {
     activeLevel,
     keybinds,
     updateKeybinds,
+    graphicsSettings,
+    selectGraphicsPreset,
+    updateGraphicsSettings,
+    resetGraphicsSettings,
     selection,
     setSelection,
     historyEntries: history.entries,

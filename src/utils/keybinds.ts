@@ -10,6 +10,7 @@ export type KeybindAction =
   | 'door'
   | 'window'
   | 'arch'
+  | 'railing'
   | 'measure_distance'
   | 'measure_area'
   | 'text'
@@ -32,6 +33,7 @@ export const DEFAULT_KEYBINDS: KeybindMap = {
   door: 'd',
   window: 'e',
   arch: 'c',
+  railing: 'l',
   measure_distance: 'm',
   measure_area: 'f',
   text: 't',
@@ -106,6 +108,12 @@ export const KEYBIND_DEFINITIONS: KeybindDefinition[] = [
     description: 'Insert a round arch, pointed arch, or cased opening',
   },
   {
+    action: 'railing',
+    label: 'Draw Railing / Balustrade',
+    group: 'Drawing & Placement Tools',
+    description: 'Draw multi-point or sloped railings along staircases and balconies',
+  },
+  {
     action: 'measure_distance',
     label: 'Corner Distance',
     group: 'Measurements & Annotations',
@@ -171,6 +179,7 @@ export const TOOL_TO_KEYBIND: Partial<Record<EditorTool, KeybindAction>> = {
   door: 'door',
   window: 'window',
   arch: 'arch',
+  railing: 'railing',
   measure_distance: 'measure_distance',
   measure_area: 'measure_area',
   text: 'text',
@@ -362,6 +371,19 @@ export const TOOL_TUTORIALS: ToolTutorial[] = [
       'Adjust opening width and sill height in the inspector.',
     ],
     tip: 'Great for connecting dining and living areas while keeping distinct floor textures per room.',
+  },
+  {
+    id: 'railing',
+    keybindAction: 'railing',
+    title: 'Architectural Railings & Balustrades',
+    category: 'Structure & Openings',
+    summary: 'Draw straight, angled, multi-segment, or sloped railings across floors, balconies, and stairs.',
+    steps: [
+      'Select Railing in the bottom dock (or pick a style preset in Catalog > Architecture) and click corner points.',
+      'Snap directly onto staircase sides or balcony edges to inherit stair pitch and deck elevation automatically.',
+      'Double-click, press Enter, or click back on the first node to finish your continuous railing.',
+    ],
+    tip: 'Switch between glass panel, frameless glass, cable, baluster, solid, minimalist, and handrail-only styles anytime in the inspector.',
   },
   {
     id: 'measure_distance',

@@ -1,9 +1,10 @@
 import React, { useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { Box, FileCode2, Image as ImageIcon, RotateCcw, Sparkles, Sun, Upload, X } from 'lucide-react';
+import { Box, FileCode2, Image as ImageIcon, Lightbulb, RotateCcw, Upload, X } from 'lucide-react';
 import {
   CatalogTemplate,
+  FurnitureInstance,
   FurnitureLightSource,
   FurniturePart,
   FurnitureRepresentation,
@@ -15,10 +16,9 @@ import {
   RepresentationMode,
 } from '../types/plan';
 import { putGlbAsset } from '../utils/assetStore';
-import {
-  createMatchingLightForGlbMaterial,
-  inspectGlbMaterials,
-} from '../utils/lighting';
+import { inspectGlbMaterials } from '../utils/lighting';
+import { InteractiveGlbPreview3D } from './InteractiveGlbPreview3D';
+import { UnifiedLightingEditor } from './UnifiedLightingEditor';
 import {
   ALL_MOUNTING_FACES,
   ALL_MOUNTING_TYPES,
@@ -67,6 +67,11 @@ export const ImporterModal: React.FC<ImporterModalProps> = ({ onClose, onImportT
   const [glbRepMode, setGlbRepMode] = useState<RepresentationMode>('silhouette');
   const [glbPreviewRep, setGlbPreviewRep] = useState<FurnitureRepresentation | null>(null);
   const [glbMaterials, setGlbMaterials] = useState<GlbInspectedMaterial[]>([]);
+  const [glbIsLight, setGlbIsLight] = useState(false);
+  const [glbSelectedMatKey, setGlbSelectedMatKey] = useState<string | null>(null);
+  const [glbSelectedLightId, setGlbSelectedLightId] = useState<string | null>(null);
+  const [glbFocusLightsSignal, setGlbFocusLightsSignal] = useState(0);
+  const [glbBackdropMode, setGlbBackdropMode] = useState<'day' | 'night'>('day');
   const [glbEmissiveOverrides, setGlbEmissiveOverrides] = useState<GlbMaterialEmissiveOverride[]>([]);
   const [glbDefaultLights, setGlbDefaultLights] = useState<FurnitureLightSource[]>([]);
   const [glbBusy, setGlbBusy] = useState(false);
@@ -241,6 +246,11 @@ export const ImporterModal: React.FC<ImporterModalProps> = ({ onClose, onImportT
               { mountingType: inspected.mountingType, mountingFace: inspected.mountingFace }
             );
             setGlbMaterials(mats);
+            setGlbIsLight(false);
+            setGlbSelectedMatKey(null);
+            setGlbSelectedLightId(null);
+            setGlbFocusLightsSignal(0);
+            setGlbBackdropMode('day');
             setGlbEmissiveOverrides([]);
             setGlbDefaultLights([]);
             regenerateGlbPreview(
@@ -349,8 +359,11 @@ export const ImporterModal: React.FC<ImporterModalProps> = ({ onClose, onImportT
         defaultElevationMm: glbMountingType === 'wall' ? 1100 : 0,
         glbAssetId: glbAssetId ?? undefined,
         glbDataUrl,
-        glbEmissiveOverrides: glbEmissiveOverrides.length > 0 ? glbEmissiveOverrides : undefined,
-        lights: glbDefaultLights.length > 0 ? glbDefaultLights : undefined,
+        isLight: glbIsLight,
+        lightingEnabled: glbIsLight ? true : undefined,
+        glbEmissiveOverrides:
+          glbIsLight && glbEmissiveOverrides.length > 0 ? glbEmissiveOverrides : undefined,
+        lights: glbIsLight && glbDefaultLights.length > 0 ? glbDefaultLights : undefined,
         representation: glbPreviewRep ?? undefined,
         isCustom: true,
         parts,
@@ -413,9 +426,53 @@ export const ImporterModal: React.FC<ImporterModalProps> = ({ onClose, onImportT
     onClose();
   };
 
+  const glbPreviewDraft = useMemo<FurnitureInstance | null>(() => {
+    if (!glbBoundsMm || !glbDataUrl) return null;
+    return {
+      id: 'preview_glb_draft',
+      templateId: 'preview_glb_draft',
+      name: name.trim() || 'GLB Model',
+      category: 'My Library',
+      xMm: 0,
+      yMm: 0,
+      elevationMm: 0,
+      rotationDeg: 0,
+      mirroredX: false,
+      mirroredY: false,
+      lockProportions: true,
+      mountingType: glbMountingType,
+      mountingFace: glbMountingFace,
+      parts: makeGlbBoundsParts(glbBoundsMm.w, glbBoundsMm.d, glbBoundsMm.h),
+      glbAssetId: glbAssetId ?? undefined,
+      glbDataUrl,
+      isLight: glbIsLight,
+      lightingEnabled: glbIsLight,
+      glbEmissiveOverrides: glbIsLight ? glbEmissiveOverrides : undefined,
+      lights: glbIsLight ? glbDefaultLights : undefined,
+      visible: true,
+      locked: false,
+    };
+  }, [
+    glbBoundsMm,
+    glbDataUrl,
+    glbAssetId,
+    name,
+    glbMountingType,
+    glbMountingFace,
+    glbIsLight,
+    glbEmissiveOverrides,
+    glbDefaultLights,
+  ]);
+
+  const isGlbPreviewLayout = tab === 'glb' && Boolean(glbPreviewDraft);
+
   return (
     <div className="fixed inset-0 z-50 bg-slate-950/60 flex items-center justify-center p-4">
-      <div className="w-full max-w-2xl max-h-[90vh] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl flex flex-col overflow-hidden text-xs">
+      <div
+        className={`w-full ${
+          isGlbPreviewLayout ? 'max-w-4xl' : 'max-w-2xl'
+        } max-h-[90vh] bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl flex flex-col overflow-hidden text-xs transition-all`}
+      >
         <header className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
           <div>
             <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
@@ -552,267 +609,265 @@ export const ImporterModal: React.FC<ImporterModalProps> = ({ onClose, onImportT
 
           {tab === 'glb' && (
             <div className="space-y-3">
-              <label className="flex flex-col items-center justify-center py-6 px-4 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-lg hover:border-blue-500 cursor-pointer">
-                <Upload className="w-5 h-5 text-slate-400 mb-1" />
-                <span className="font-medium">Choose .glb or .gltf 3D file</span>
-                <input type="file" accept=".glb,.gltf" onChange={handleGlbUpload} className="hidden" />
-              </label>
+              {/* Dropzone shown ONLY before a GLB file is loaded; replaced by 3D Preview afterward */}
+              {!glbPreviewDraft && (
+                <label className="flex flex-col items-center justify-center py-8 px-4 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-lg hover:border-blue-500 cursor-pointer">
+                  <Upload className="w-5 h-5 text-slate-400 mb-1.5" />
+                  <span className="font-medium text-slate-800 dark:text-slate-100">
+                    Choose .glb or .gltf 3D file
+                  </span>
+                  <span className="text-[11px] text-slate-500 mt-0.5">
+                    Inspect in interactive 3D and optionally configure emissive materials and lights
+                  </span>
+                  <input type="file" accept=".glb,.gltf" onChange={handleGlbUpload} className="hidden" />
+                </label>
+              )}
+
               {glbBusy && (
                 <p className="text-slate-500">
-                  Reading 3D mesh geometry and extracting 5 orthographic SVG projections...
+                  Loading 3D mesh geometry and extracting 2D projections...
                 </p>
               )}
-              {glbBoundsMm && (
-                <div className="space-y-2.5">
-                  <div className="p-2.5 rounded bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
-                    <span className="font-mono tabular-nums text-slate-700 dark:text-slate-200">
-                      {(glbBoundsMm.w / 10).toFixed(0)} × {(glbBoundsMm.d / 10).toFixed(0)} × {(glbBoundsMm.h / 10).toFixed(0)} cm
-                    </span>
-                    <div className="flex items-center gap-1 p-0.5 rounded bg-slate-200/70 dark:bg-slate-800">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setGlbRepMode('silhouette');
-                          if (glbSceneRef.current && glbAssetId && glbDataUrl && glbBoundsMm) {
-                            regenerateGlbPreview(
-                              glbSceneRef.current,
-                              glbAssetId,
-                              glbDataUrl,
-                              glbBoundsMm,
-                              'silhouette',
-                              glbMountingType,
-                              glbMountingFace
-                            );
-                          }
-                        }}
-                        className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer ${
-                          glbRepMode === 'silhouette'
-                            ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                            : 'text-slate-600 dark:text-slate-300'
-                        }`}
-                      >
-                        Silhouette
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setGlbRepMode('hidden_line');
-                          if (glbSceneRef.current && glbAssetId && glbDataUrl && glbBoundsMm) {
-                            regenerateGlbPreview(
-                              glbSceneRef.current,
-                              glbAssetId,
-                              glbDataUrl,
-                              glbBoundsMm,
-                              'hidden_line',
-                              glbMountingType,
-                              glbMountingFace
-                            );
-                          }
-                        }}
-                        className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer ${
-                          glbRepMode === 'hidden_line'
-                            ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
-                            : 'text-slate-600 dark:text-slate-300'
-                        }`}
-                      >
-                        Hidden-Line
-                      </button>
-                    </div>
-                  </div>
 
-                  {/* Detected Mounting Type & Orientation Presets */}
-                  <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-medium text-slate-700 dark:text-slate-200">
-                        Mounting Type
+              {glbPreviewDraft && glbBoundsMm && (
+                <div className="grid grid-cols-1 md:grid-cols-[1.15fr_1fr] gap-4 items-start">
+                  {/* Left Column: Interactive 3D Preview (replaces dropbox) + Dimensions & Replace */}
+                  <div className="space-y-2">
+                    <InteractiveGlbPreview3D
+                      furn={glbPreviewDraft}
+                      glbScene={glbSceneRef.current}
+                      mountingType={glbMountingType}
+                      mountingFace={glbMountingFace}
+                      selectedMaterialKey={glbIsLight ? glbSelectedMatKey : null}
+                      backdropMode={glbBackdropMode}
+                      onBackdropModeChange={setGlbBackdropMode}
+                      showLightGizmo={glbIsLight}
+                      selectedLightId={glbSelectedLightId}
+                      onSelectLightId={(id) => {
+                        setGlbSelectedLightId(id);
+                        if (id) {
+                          setGlbSelectedMatKey(null);
+                          setGlbFocusLightsSignal((s) => s + 1);
+                        }
+                      }}
+                      onUpdateLight={(lightId, patch) =>
+                        setGlbDefaultLights((prev) =>
+                          prev.map((l) => (l.id === lightId ? { ...l, ...patch } : l))
+                        )
+                      }
+                      className="h-[340px]"
+                    />
+
+                    <div className="px-2.5 py-2 rounded-md bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
+                      <span className="font-mono tabular-nums text-slate-700 dark:text-slate-200">
+                        {(glbBoundsMm.w / 10).toFixed(0)} × {(glbBoundsMm.d / 10).toFixed(0)} × {(glbBoundsMm.h / 10).toFixed(0)} cm
                       </span>
-                      {glbInspectReason && (
-                        <span className="text-[10px] text-slate-500 truncate">
-                          Auto · {glbInspectReason}
-                        </span>
-                      )}
-                    </div>
-                    <div className="grid grid-cols-5 gap-1">
-                      {ALL_MOUNTING_TYPES.map((mt) => (
-                        <button
-                          key={mt}
-                          type="button"
-                          onClick={() =>
-                            applyGlbMountingUpdate(mt, defaultMountingFaceForType(mt))
-                          }
-                          className={`py-1 px-1.5 rounded text-[11px] font-medium border cursor-pointer ${
-                            glbMountingType === mt
-                              ? 'border-blue-600 bg-blue-600 text-white'
-                              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
-                          }`}
-                        >
-                          {MOUNTING_TYPE_LABELS[mt]}
-                        </button>
-                      ))}
+                      <label className="px-2.5 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-[11px] font-medium text-slate-700 dark:text-slate-200 cursor-pointer whitespace-nowrap">
+                        Replace File
+                        <input type="file" accept=".glb,.gltf" onChange={handleGlbUpload} className="hidden" />
+                      </label>
                     </div>
 
-                    <div className="flex items-center justify-between gap-2 pt-1">
-                      <span className="font-medium text-slate-700 dark:text-slate-200">
-                        Model Mounting Face
-                      </span>
-                      <span className="text-[10px] text-slate-500">
-                        Source face aligned to {MOUNTING_TYPE_LABELS[glbMountingType].toLowerCase()}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-1">
-                      {ALL_MOUNTING_FACES.map((mf) => (
-                        <button
-                          key={mf}
-                          type="button"
-                          onClick={() => applyGlbMountingUpdate(glbMountingType, mf)}
-                          className={`py-1 px-1.5 rounded text-[11px] font-medium border cursor-pointer ${
-                            glbMountingFace === mf
-                              ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
-                              : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
-                          }`}
-                        >
-                          {MOUNTING_FACE_LABELS[mf]}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {glbMaterials.length > 0 && (
-                    <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-1.5">
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-                          Materials &amp; Emissive Glow ({glbMaterials.length})
-                        </span>
-                        <span className="text-[10px] text-slate-500">
-                          {glbDefaultLights.length} light{glbDefaultLights.length === 1 ? '' : 's'} paired
-                        </span>
-                      </div>
-                      <div className="max-h-32 overflow-y-auto space-y-1 pr-0.5">
-                        {glbMaterials.map((mat) => {
-                          const existingOv = glbEmissiveOverrides.find(
-                            (o) => o.materialKey === mat.materialKey
-                          );
-                          const isGlowOn = existingOv
-                            ? existingOv.enabled
-                            : mat.emissiveDetected && !mat.emissiveDisabled;
-                          const effectiveColor =
-                            existingOv?.emissiveColor ??
-                            (mat.emissiveHex !== '#000000' ? mat.emissiveHex : mat.baseColorHex);
-                          const hasPairedLight = glbDefaultLights.some(
-                            (l) => l.sourceRef === mat.materialKey
-                          );
+                    {glbPreviewRep?.autoViews?.top && glbPreviewRep.autoViews.front && (
+                      <div className="grid grid-cols-2 gap-2">
+                        {(['top', 'front'] as const).map((viewId) => {
+                          const pv = glbPreviewRep.autoViews![viewId]!;
+                          const pad = Math.max(pv.viewBox.width, pv.viewBox.height) * 0.14 + 30;
+                          const vb = `${pv.viewBox.minX - pad} ${pv.viewBox.minY - pad} ${pv.viewBox.width + pad * 2} ${pv.viewBox.height + pad * 2}`;
                           return (
                             <div
-                              key={mat.materialKey}
-                              className="flex items-center justify-between gap-2 px-2 py-1 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                              key={viewId}
+                              className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white"
                             >
-                              <div className="flex items-center gap-1.5 min-w-0">
-                                <span
-                                  className="w-3 h-3 rounded-sm border border-black/20 shrink-0"
-                                  style={{ backgroundColor: effectiveColor }}
-                                />
-                                <span className="truncate font-medium text-slate-700 dark:text-slate-200">
-                                  {mat.materialName}
-                                </span>
-                                {mat.emissiveDisabled && !existingOv && (
-                                  <span className="px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 text-[9px] shrink-0">
-                                    Disabled Emissive
-                                  </span>
-                                )}
-                                {mat.hasEmissiveMap && !mat.emissiveDisabled && (
-                                  <span className="px-1 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 text-[9px] shrink-0">
-                                    Emissive Map
-                                  </span>
-                                )}
+                              <div className="text-[10px] font-medium text-slate-500 mb-1">
+                                {viewId === 'top' ? '2D Plan (Top)' : 'Front Elevation'}
                               </div>
-                              <div className="flex items-center gap-1 shrink-0">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    const nextEnabled = !isGlowOn;
-                                    const nextColor =
-                                      mat.emissiveHex !== '#000000'
-                                        ? mat.emissiveHex
-                                        : mat.baseColorHex !== '#000000'
-                                          ? mat.baseColorHex
-                                          : '#FF9F43';
-                                    const nextOv: GlbMaterialEmissiveOverride = existingOv
-                                      ? { ...existingOv, enabled: nextEnabled }
-                                      : {
-                                          materialKey: mat.materialKey,
-                                          materialName: mat.materialName,
-                                          meshNames: mat.meshNames,
-                                          enabled: nextEnabled,
-                                          emissiveColor: nextColor,
-                                          emissiveIntensity: Math.max(1.2, mat.emissiveIntensity || 1.4),
-                                          bloomBoost: 1.25,
-                                          preserveEmissiveMap: mat.hasEmissiveMap,
-                                        };
-                                    setGlbEmissiveOverrides((prev) => [
-                                      ...prev.filter((o) => o.materialKey !== mat.materialKey),
-                                      nextOv,
-                                    ]);
-                                  }}
-                                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium border cursor-pointer ${
-                                    isGlowOn
-                                      ? 'bg-amber-500/15 border-amber-500/60 text-amber-700 dark:text-amber-300'
-                                      : 'border-slate-200 dark:border-slate-700 text-slate-500'
-                                  }`}
-                                >
-                                  {isGlowOn ? 'Glow ON' : 'Glow OFF'}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    if (hasPairedLight) {
-                                      setGlbDefaultLights((prev) =>
-                                        prev.filter((l) => l.sourceRef !== mat.materialKey)
-                                      );
-                                    } else {
-                                      const l = createMatchingLightForGlbMaterial(mat, existingOv);
-                                      setGlbDefaultLights((prev) => [...prev, l]);
-                                    }
-                                  }}
-                                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium border inline-flex items-center gap-0.5 cursor-pointer ${
-                                    hasPairedLight
-                                      ? 'bg-blue-600 text-white border-blue-600'
-                                      : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
-                                  }`}
-                                >
-                                  <Sun className="w-2.5 h-2.5" />
-                                  {hasPairedLight ? 'Lit' : '+ Light'}
-                                </button>
-                              </div>
+                              <svg viewBox={vb} className="w-full h-20">
+                                {renderFurnitureRepresentationView(glbPreviewRep, viewId)}
+                              </svg>
                             </div>
                           );
                         })}
                       </div>
-                    </div>
-                  )}
+                    )}
+                  </div>
 
-                  {glbPreviewRep?.autoViews?.top && glbPreviewRep.autoViews.front && (
-                    <div className="grid grid-cols-2 gap-2">
-                      {(['top', 'front'] as const).map((viewId) => {
-                        const pv = glbPreviewRep.autoViews![viewId]!;
-                        const pad = Math.max(pv.viewBox.width, pv.viewBox.height) * 0.14 + 30;
-                        const vb = `${pv.viewBox.minX - pad} ${pv.viewBox.minY - pad} ${pv.viewBox.width + pad * 2} ${pv.viewBox.height + pad * 2}`;
-                        return (
-                          <div
-                            key={viewId}
-                            className="p-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white"
+                  {/* Right Column: Mounting, 2D Style, "Is a light" Toggle & Unified Materials/Lights */}
+                  <div className="space-y-3">
+                    {/* Mounting & 2D Mode */}
+                    <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-950/60 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-medium text-slate-700 dark:text-slate-200">
+                          Mounting
+                        </span>
+                        <div className="flex items-center gap-1 p-0.5 rounded bg-slate-200/70 dark:bg-slate-800">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setGlbRepMode('silhouette');
+                              if (glbSceneRef.current && glbAssetId && glbDataUrl && glbBoundsMm) {
+                                regenerateGlbPreview(
+                                  glbSceneRef.current,
+                                  glbAssetId,
+                                  glbDataUrl,
+                                  glbBoundsMm,
+                                  'silhouette',
+                                  glbMountingType,
+                                  glbMountingFace
+                                );
+                              }
+                            }}
+                            className={`px-2 py-0.5 rounded text-[10px] font-medium cursor-pointer ${
+                              glbRepMode === 'silhouette'
+                                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                                : 'text-slate-600 dark:text-slate-300'
+                            }`}
                           >
-                            <div className="text-[10px] font-medium text-slate-500 mb-1">
-                              {viewId === 'top' ? '2D Plan (Top Projection)' : 'Wall View (Front Elevation)'}
-                            </div>
-                            <svg viewBox={vb} className="w-full h-28">
-                              {renderFurnitureRepresentationView(glbPreviewRep, viewId)}
-                            </svg>
-                          </div>
-                        );
-                      })}
+                            Silhouette
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setGlbRepMode('hidden_line');
+                              if (glbSceneRef.current && glbAssetId && glbDataUrl && glbBoundsMm) {
+                                regenerateGlbPreview(
+                                  glbSceneRef.current,
+                                  glbAssetId,
+                                  glbDataUrl,
+                                  glbBoundsMm,
+                                  'hidden_line',
+                                  glbMountingType,
+                                  glbMountingFace
+                                );
+                              }
+                            }}
+                            className={`px-2 py-0.5 rounded text-[10px] font-medium cursor-pointer ${
+                              glbRepMode === 'hidden_line'
+                                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-xs'
+                                : 'text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            Hidden-Line
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-5 gap-1">
+                        {ALL_MOUNTING_TYPES.map((mt) => (
+                          <button
+                            key={mt}
+                            type="button"
+                            onClick={() =>
+                              applyGlbMountingUpdate(mt, defaultMountingFaceForType(mt))
+                            }
+                            className={`py-1 px-1 rounded text-[10px] font-medium border cursor-pointer ${
+                              glbMountingType === mt
+                                ? 'border-blue-600 bg-blue-600 text-white'
+                                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            {MOUNTING_TYPE_LABELS[mt]}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="flex items-center justify-between gap-2 pt-0.5">
+                        <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
+                          Model Face
+                        </span>
+                        {glbInspectReason && (
+                          <span className="text-[10px] text-slate-400 truncate">
+                            {glbInspectReason}
+                          </span>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-3 gap-1">
+                        {ALL_MOUNTING_FACES.map((mf) => (
+                          <button
+                            key={mf}
+                            type="button"
+                            onClick={() => applyGlbMountingUpdate(glbMountingType, mf)}
+                            className={`py-1 px-1 rounded text-[10px] font-medium border cursor-pointer ${
+                              glbMountingFace === mf
+                                ? 'border-blue-600 bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300'
+                                : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            {MOUNTING_FACE_LABELS[mf]}
+                          </button>
+                        ))}
+                      </div>
                     </div>
-                  )}
+
+                    {/* "Is a light" Master Opt-In Toggle (OFF by default) */}
+                    <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Lightbulb
+                          className={`w-4 h-4 shrink-0 ${
+                            glbIsLight ? 'text-amber-500' : 'text-slate-400'
+                          }`}
+                        />
+                        <div className="min-w-0">
+                          <div className="font-semibold text-slate-900 dark:text-slate-100">
+                            Is a light
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {glbIsLight
+                              ? 'Configure glowing materials and light sources below'
+                              : 'Enable to set emissive glow and light sources for this object'}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={glbIsLight}
+                        aria-label="Is a light"
+                        onClick={() => {
+                          const next = !glbIsLight;
+                          setGlbIsLight(next);
+                          if (!next) {
+                            setGlbSelectedMatKey(null);
+                          }
+                        }}
+                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors cursor-pointer ${
+                          glbIsLight
+                            ? 'bg-blue-600 border-blue-600'
+                            : 'bg-slate-200 dark:bg-slate-700 border-slate-300 dark:border-slate-600'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-xs transition-transform ${
+                            glbIsLight ? 'translate-x-4' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </button>
+                    </div>
+
+                    {/* Unified Materials & Lighting Editor (Revealed ONLY when "Is a light" is ON) */}
+                    {glbIsLight && (
+                      <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-950/50">
+                        <UnifiedLightingEditor
+                          furn={glbPreviewDraft}
+                          unit="cm"
+                          glbMaterials={glbMaterials}
+                          selectedMaterialKey={glbSelectedMatKey}
+                          onSelectMaterialKey={setGlbSelectedMatKey}
+                          selectedLightId={glbSelectedLightId}
+                          onSelectLightId={setGlbSelectedLightId}
+                          focusLightsTabSignal={glbFocusLightsSignal}
+                          onChange={(patch) => {
+                            if (patch.glbEmissiveOverrides !== undefined) {
+                              setGlbEmissiveOverrides(patch.glbEmissiveOverrides);
+                            }
+                            if (patch.lights !== undefined) {
+                              setGlbDefaultLights(patch.lights);
+                            }
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>

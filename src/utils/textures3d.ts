@@ -21,8 +21,23 @@ import slateTexUrl from '../assets/images/slate_stone_tex_1794957071075.jpg';
 type TexRole = 'albedo' | 'bump' | 'roughness';
 
 const TEXTURE_CACHE = new Map<string, THREE.CanvasTexture>();
+const MAX_TEXTURE_CACHE_ENTRIES = 96;
 const IMAGE_CACHE = new Map<string, HTMLImageElement>();
 const PENDING_DRAWS = new Map<string, Array<() => void>>();
+
+function setCachedTexture(key: string, tex: THREE.CanvasTexture): void {
+  if (TEXTURE_CACHE.has(key)) {
+    TEXTURE_CACHE.delete(key);
+  }
+  TEXTURE_CACHE.set(key, tex);
+  while (TEXTURE_CACHE.size > MAX_TEXTURE_CACHE_ENTRIES) {
+    const oldestKey = TEXTURE_CACHE.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldestTex = TEXTURE_CACHE.get(oldestKey);
+    TEXTURE_CACHE.delete(oldestKey);
+    oldestTex?.dispose();
+  }
+}
 
 let onTextureReadyCallback: (() => void) | null = null;
 
@@ -502,18 +517,49 @@ function renderPhotoDerivedTexture(
   }
 }
 
+function applyTextureSampling(
+  tex: THREE.CanvasTexture,
+  filtering: 'nearest' | 'bilinear' | 'trilinear',
+  anisotropy: number
+): void {
+  if (filtering === 'nearest') {
+    tex.magFilter = THREE.NearestFilter;
+    tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.anisotropy = 1;
+  } else if (filtering === 'bilinear') {
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearFilter;
+    tex.generateMipmaps = false;
+    tex.anisotropy = Math.max(1, anisotropy);
+  } else {
+    tex.magFilter = THREE.LinearFilter;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.generateMipmaps = true;
+    tex.anisotropy = Math.max(1, anisotropy);
+  }
+}
+
 function getOrCreatePresetTexture(
   preset: MaterialPreset,
   role: TexRole,
   scale = 1,
   rotDeg = 0,
-  maxAnisotropy = 4
+  maxAnisotropy = 4,
+  texRes: 256 | 512 | 1024 = 512,
+  texFilter: 'nearest' | 'bilinear' | 'trilinear' = 'trilinear'
 ): THREE.CanvasTexture {
-  const key = `${role}_${preset}_${scale.toFixed(2)}_${Math.round(rotDeg)}`;
+  const effectiveAniso = texFilter === 'nearest' ? 1 : Math.max(1, Math.round(maxAnisotropy));
+  const key = `${role}_${preset}_${scale.toFixed(2)}_${Math.round(rotDeg)}_${texRes}_${texFilter}_${effectiveAniso}`;
   const existing = TEXTURE_CACHE.get(key);
-  if (existing) return existing;
+  if (existing) {
+    // Refresh LRU position
+    TEXTURE_CACHE.delete(key);
+    TEXTURE_CACHE.set(key, existing);
+    return existing;
+  }
 
-  const size = 512;
+  const size = texRes;
   const [canvas, ctx] = makeCanvas(size);
 
   const tex = new THREE.CanvasTexture(canvas);
@@ -526,7 +572,7 @@ function getOrCreatePresetTexture(
   tex.repeat.set(repeat, repeat);
   tex.center.set(0.5, 0.5);
   tex.rotation = (rotDeg * Math.PI) / 180;
-  tex.anisotropy = maxAnisotropy;
+  applyTextureSampling(tex, texFilter, effectiveAniso);
 
   const photoUrl = getSourceImageUrl(preset);
   if (photoUrl) {
@@ -547,7 +593,7 @@ function getOrCreatePresetTexture(
   }
 
   tex.needsUpdate = true;
-  TEXTURE_CACHE.set(key, tex);
+  setCachedTexture(key, tex);
   return tex;
 }
 
@@ -615,6 +661,12 @@ export interface ArchitecturalMaterialOptions {
   scale?: number;
   rotDeg?: number;
   maxAnisotropy?: number;
+  anisotropyLevel?: number;
+  textureResolution?: 256 | 512 | 1024;
+  textureFiltering?: 'nearest' | 'bilinear' | 'trilinear';
+  materialQuality?: 'standard' | 'physical';
+  reflectionQuality?: 'off' | 'low' | 'medium' | 'high';
+  transparentQuality?: 'standard' | 'high';
   clippingPlanes?: THREE.Plane[];
   isSoftwareGl?: boolean;
   roughness?: number;
@@ -778,6 +830,20 @@ export function createRugPatternTexture(seedKey: string): THREE.CanvasTexture {
   return tex;
 }
 
+function reflectionMultiplier(quality: 'off' | 'low' | 'medium' | 'high' | undefined): number {
+  switch (quality) {
+    case 'off':
+      return 0;
+    case 'low':
+      return 0.35;
+    case 'medium':
+      return 0.7;
+    case 'high':
+    default:
+      return 1.0;
+  }
+}
+
 export function buildArchitecturalMaterial(
   preset: MaterialPreset,
   colorHex: string,
@@ -787,18 +853,27 @@ export function buildArchitecturalMaterial(
   const tileM = getDefaultTileMeters(preset);
   const scale = userScale / tileM;
   const rotDeg = options.rotDeg ?? 0;
-  const maxAniso = options.maxAnisotropy ?? 4;
+  const hwMaxAniso = Math.max(1, options.maxAnisotropy ?? 4);
+  const requestedAniso = options.anisotropyLevel ?? hwMaxAniso;
+  const maxAniso = Math.max(1, Math.min(hwMaxAniso, requestedAniso));
+  const texRes: 256 | 512 | 1024 = options.textureResolution ?? 512;
+  const texFilter: 'nearest' | 'bilinear' | 'trilinear' = options.textureFiltering ?? 'trilinear';
+  const reflScale = reflectionMultiplier(options.reflectionQuality);
+  const usePhysical = !options.isSoftwareGl && options.materialQuality !== 'standard';
+  const highTransparent = !options.isSoftwareGl && options.transparentQuality !== 'standard';
 
   if (preset === 'glass') {
-    if (!options.isSoftwareGl) {
+    if (highTransparent && usePhysical) {
       return new THREE.MeshPhysicalMaterial({
         color: new THREE.Color(colorHex || '#E0F2FE'),
-        roughness: options.roughness ?? 0.05,
-        metalness: options.metalness ?? 0.05,
-        clearcoat: 0.35,
+        roughness: options.roughness ?? 0.04,
+        metalness: options.metalness ?? 0,
+        clearcoat: reflScale > 0 ? 0.16 : 0,
         clearcoatRoughness: 0.06,
+        reflectivity: 0.55 * Math.max(0.25, reflScale),
+        envMapIntensity: 0.24 * reflScale,
         transparent: true,
-        opacity: 0.22,
+        opacity: 0.16,
         depthWrite: false,
         side: THREE.DoubleSide,
         clippingPlanes: options.clippingPlanes,
@@ -807,9 +882,10 @@ export function buildArchitecturalMaterial(
     return new THREE.MeshStandardMaterial({
       color: new THREE.Color(colorHex || '#E0F2FE'),
       roughness: options.roughness ?? 0.06,
-      metalness: options.metalness ?? 0.08,
+      metalness: options.metalness ?? 0,
+      envMapIntensity: 0.2 * reflScale,
       transparent: true,
-      opacity: 0.22,
+      opacity: 0.16,
       depthWrite: false,
       side: THREE.DoubleSide,
       clippingPlanes: options.clippingPlanes,
@@ -828,14 +904,14 @@ export function buildArchitecturalMaterial(
 
   const hasPhotoOrPattern = !isPlainFlat;
   const map = hasPhotoOrPattern
-    ? getOrCreatePresetTexture(preset, 'albedo', scale, rotDeg, maxAniso)
+    ? getOrCreatePresetTexture(preset, 'albedo', scale, rotDeg, maxAniso, texRes, texFilter)
     : null;
   const bumpMap = hasPhotoOrPattern
-    ? getOrCreatePresetTexture(preset, 'bump', scale, rotDeg, maxAniso)
+    ? getOrCreatePresetTexture(preset, 'bump', scale, rotDeg, maxAniso, texRes, texFilter)
     : null;
   const roughnessMap =
-    hasPhotoOrPattern && !options.isSoftwareGl && getSourceImageUrl(preset)
-      ? getOrCreatePresetTexture(preset, 'roughness', scale, rotDeg, maxAniso)
+    hasPhotoOrPattern && usePhysical && getSourceImageUrl(preset)
+      ? getOrCreatePresetTexture(preset, 'roughness', scale, rotDeg, maxAniso, texRes, texFilter)
       : null;
 
   const bumpScaleMap: Partial<Record<MaterialPreset, number>> = {
@@ -878,7 +954,15 @@ export function buildArchitecturalMaterial(
   const effectiveColorHex =
     isPresetPreTinted(preset) && normalizedHex === '#FFFFFF' ? '#FFFFFF' : normalizedHex;
 
-  if (!options.isSoftwareGl) {
+  const isMetal =
+    preset === 'metal' ||
+    preset === 'brass' ||
+    preset === 'bronze' ||
+    preset === 'chrome' ||
+    preset === 'matte_black_metal';
+  const baseEnvIntensity = options.envMapIntensity ?? (isMetal ? 0.82 : 0.34);
+
+  if (usePhysical) {
     const clearcoat =
       options.clearcoat ??
       (preset === 'marble' ||
@@ -894,12 +978,6 @@ export function buildArchitecturalMaterial(
 
     const isTextile = preset === 'fabric' || preset === 'boucle' || preset === 'velvet';
     const sheen = options.sheen ?? (preset === 'velvet' ? 0.85 : isTextile ? 0.55 : 0);
-    const isMetal =
-      preset === 'metal' ||
-      preset === 'brass' ||
-      preset === 'bronze' ||
-      preset === 'chrome' ||
-      preset === 'matte_black_metal';
 
     return new THREE.MeshPhysicalMaterial({
       color: new THREE.Color(effectiveColorHex),
@@ -907,10 +985,10 @@ export function buildArchitecturalMaterial(
       bumpMap,
       bumpScale: bumpScaleMap[preset] ?? 0,
       roughnessMap,
-      envMapIntensity: options.envMapIntensity ?? (isMetal ? 0.82 : 0.34),
+      envMapIntensity: baseEnvIntensity * reflScale,
       roughness: baseRoughness,
       metalness: baseMetalness,
-      clearcoat,
+      clearcoat: reflScale === 0 ? 0 : clearcoat * Math.max(0.35, reflScale),
       clearcoatRoughness:
         preset === 'plastic_gloss' || preset === 'marble' || preset === 'calacatta_gold' || preset === 'nero_marble'
           ? 0.12
@@ -929,10 +1007,10 @@ export function buildArchitecturalMaterial(
     map,
     bumpMap,
     bumpScale: bumpScaleMap[preset] ?? 0,
-    envMapIntensity: options.envMapIntensity ?? 0.32,
+    envMapIntensity: baseEnvIntensity * reflScale,
     roughness: baseRoughness,
     metalness: baseMetalness,
     clippingPlanes: options.clippingPlanes,
-    clipShadows: false,
+    clipShadows: !options.isSoftwareGl,
   });
 }

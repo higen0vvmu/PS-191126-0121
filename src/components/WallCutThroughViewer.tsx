@@ -1310,7 +1310,7 @@ export const WallCutThroughViewer: React.FC<WallCutThroughViewerProps> = ({
             fontWeight={isHov ? 700 : 600}
             fill={textColor}
           >
-            {opts.locked ? `🔒 ${labelText}` : labelText}
+            {opts.locked ? `[LOCKED] ${labelText}` : labelText}
           </text>
         </g>
         <line

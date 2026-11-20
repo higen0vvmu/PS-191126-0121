@@ -5,9 +5,14 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { Camera, Eye, Compass, Sun, Moon, Layers } from 'lucide-react';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { BokehPass } from 'three/addons/postprocessing/BokehPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+import { Camera, Eye, Compass, Sun, Moon, Layers, SlidersHorizontal } from 'lucide-react';
 import {
   ArchElement,
   CameraPreset,
@@ -25,8 +30,10 @@ import {
   getChimneyWorldCorners,
   getEnclosingRoomCeilingMm,
   getWallCenterlinePoint,
+  isRugFurniture,
   pointInPolygon,
   resolveChimneyFaceColors,
+  wallOffsets,
 } from '../utils/geometry';
 import {
   resolveFurnitureMountingFace,
@@ -37,16 +44,24 @@ import {
   loadGlbObjectCached,
 } from '../utils/furnitureRepresentationSync';
 import {
+  type ArchitecturalMaterialOptions,
   applyWorldSpaceUVs,
   buildArchitecturalMaterial,
   setTextureReadyCallback,
 } from '../utils/textures3d';
 import { buildProceduralFurnitureGroup } from '../utils/furniture3d';
+import { resolveRailingConfig } from '../utils/railings';
+import {
+  buildHostDeckRailings3DGroup,
+  buildRailing3DGroup,
+  buildStaircase3DGroup,
+} from '../utils/railings3d';
 import {
   applyGlbEmissiveOverrides,
   assignInteriorShadowBudget,
   buildThreeLightsForFurniture,
   type EmissiveTargetEntry,
+  isFurnitureLightingActive,
   type SceneBulbLightEntry,
 } from '../utils/lighting';
 import { buildDetailedPersonGroup } from '../utils/people3d';
@@ -58,6 +73,11 @@ import {
   WalkCollider,
   WalkState,
 } from '../utils/walkPhysics';
+import type {
+  ConcreteGraphicsPresetId,
+  GraphicsSettings,
+} from '../utils/graphicsSettings';
+import { GraphicsSettingsPanel } from './GraphicsSettingsPanel';
 
 function getEffectiveFovDeg(preset: CameraPreset, baseFovDeg: number): number {
   return preset === 'walkthrough'
@@ -65,12 +85,78 @@ function getEffectiveFovDeg(preset: CameraPreset, baseFovDeg: number): number {
     : baseFovDeg;
 }
 
+let sharedContactShadowTex: THREE.CanvasTexture | null = null;
+function getContactShadowTexture(): THREE.CanvasTexture | null {
+  if (sharedContactShadowTex) return sharedContactShadowTex;
+  if (typeof document === 'undefined') return null;
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+  ctx.clearRect(0, 0, size, size);
+  const grad = ctx.createRadialGradient(size / 2, size / 2, size * 0.14, size / 2, size / 2, size * 0.5);
+  grad.addColorStop(0, 'rgba(15, 23, 42, 0.72)');
+  grad.addColorStop(0.55, 'rgba(15, 23, 42, 0.34)');
+  grad.addColorStop(1, 'rgba(15, 23, 42, 0.0)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  sharedContactShadowTex = tex;
+  return tex;
+}
+
+function getEffectiveDpr(renderScale: number, isSoftwareGl: boolean): number {
+  if (isSoftwareGl) return 1;
+  return Math.max(0.65, Math.min(2.25, renderScale));
+}
+
+function applyInteriorLightAndShadowBudget(
+  bulbLights: SceneBulbLightEntry[],
+  nightMix: number,
+  maxRealtimeLights: number,
+  castShadows: boolean,
+  lightQuality: GraphicsSettings['lightQuality']
+): SceneBulbLightEntry[] {
+  const prioritized = bulbLights
+    .slice()
+    .sort(
+      (a, b) =>
+        Number(Boolean(b.userCastShadow)) - Number(Boolean(a.userCastShadow)) ||
+        Number(b.isCeiling) - Number(a.isCeiling) ||
+        b.baseIntensity - a.baseIntensity
+    );
+  const active = prioritized.slice(0, Math.max(1, maxRealtimeLights));
+  const overflow = prioritized.slice(Math.max(1, maxRealtimeLights));
+  const boost = THREE.MathUtils.lerp(0.24, 0.62, nightMix);
+  for (const entry of active) {
+    entry.light.visible = true;
+    entry.light.intensity = entry.baseIntensity * boost;
+  }
+  for (const entry of overflow) {
+    entry.light.visible = false;
+    entry.light.intensity = 0;
+    if ('castShadow' in entry.light && typeof entry.light.castShadow === 'boolean') {
+      entry.light.castShadow = false;
+    }
+  }
+  const maxInteriorShadows = lightQuality === 'low' ? 0 : lightQuality === 'medium' ? 1 : 3;
+  assignInteriorShadowBudget(active, castShadows && maxInteriorShadows > 0, maxInteriorShadows);
+  return active;
+}
+
 interface Viewport3DProps {
   level: Level;
   settings: ProjectSettings;
+  graphicsSettings: GraphicsSettings;
   cameraPreset: CameraPreset;
   onCameraPresetChange: (preset: CameraPreset) => void;
   onUpdateSettings: (partial: Partial<ProjectSettings>) => void;
+  onSelectGraphicsPreset: (preset: ConcreteGraphicsPresetId) => void;
+  onUpdateGraphicsSettings: (partial: Partial<GraphicsSettings>) => void;
+  onResetGraphicsSettings: () => void;
   onCanvasReady?: (captureFn: () => string | null) => void;
 }
 
@@ -111,20 +197,32 @@ function detectSoftwareGl(): boolean {
 export const Viewport3D: React.FC<Viewport3DProps> = ({
   level,
   settings,
+  graphicsSettings,
   cameraPreset,
   onCameraPresetChange,
   onUpdateSettings,
+  onSelectGraphicsPreset,
+  onUpdateGraphicsSettings,
+  onResetGraphicsSettings,
   onCanvasReady,
 }) => {
   const mountRef = useRef<HTMLDivElement>(null);
+  const graphicsPopoverWrapRef = useRef<HTMLDivElement>(null);
   const [walkHint, setWalkHint] = useState(false);
   const [pointerLocked, setPointerLocked] = useState(false);
   const [ceilingMode, setCeilingMode] = useState<'auto' | 'solid' | 'off'>('auto');
+  const [showGraphicsPopover, setShowGraphicsPopover] = useState(false);
 
   // Refs to keep Three.js loop decoupled from React re-renders
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const composerRef = useRef<EffectComposer | null>(null);
+  const gtaoPassRef = useRef<GTAOPass | null>(null);
   const bloomPassRef = useRef<UnrealBloomPass | null>(null);
+  const bokehPassRef = useRef<BokehPass | null>(null);
+  const smaaPassRef = useRef<SMAAPass | null>(null);
+  const colorGradePassRef = useRef<ShaderPass | null>(null);
+  const fxaaPassRef = useRef<ShaderPass | null>(null);
+  const envTexRef = useRef<THREE.Texture | null>(null);
   const composerRtRef = useRef<THREE.WebGLRenderTarget | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -135,6 +233,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
   const bounceLightRef = useRef<THREE.DirectionalLight | null>(null);
   const hemiLightRef = useRef<THREE.HemisphereLight | null>(null);
   const lampLightsRef = useRef<SceneBulbLightEntry[]>([]);
+  const activeLampLightsRef = useRef<SceneBulbLightEntry[]>([]);
   const emissiveTargetsRef = useRef<EmissiveTargetEntry[]>([]);
   const windowAreaLightsRef = useRef<Array<{ light: THREE.RectAreaLight; baseIntensity: number }>>([]);
   const gridHelperRef = useRef<THREE.GridHelper | null>(null);
@@ -149,6 +248,8 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
   const planBoundsRef = useRef<{ cx: number; cz: number; radius: number }>({ cx: 0, cz: 0, radius: 12 });
   const isSoftwareGlRef = useRef<boolean>(false);
   const requestRenderRef = useRef<() => void>(() => {});
+  const graphicsRef = useRef<GraphicsSettings>(graphicsSettings);
+  graphicsRef.current = graphicsSettings;
 
   // 175cm Physical Walk Mode refs
   const walkCollidersRef = useRef<WalkCollider[]>([]);
@@ -208,6 +309,9 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     const isSoftwareGl = detectSoftwareGl();
     isSoftwareGlRef.current = isSoftwareGl;
 
+    const initGx = graphicsRef.current;
+    const initDpr = getEffectiveDpr(initGx.renderScale, isSoftwareGl);
+
     const renderer = new THREE.WebGLRenderer({
       antialias: !isSoftwareGl,
       powerPreference: 'high-performance',
@@ -216,15 +320,16 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.08;
     renderer.localClippingEnabled = true;
-    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(initDpr);
     renderer.shadowMap.enabled = !isSoftwareGl;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type =
+      initGx.shadowSoftness <= 0.35 ? THREE.BasicShadowMap : THREE.PCFSoftShadowMap;
     renderer.setSize(container.clientWidth || 800, container.clientHeight || 600);
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
     const initNight = (settingsRef.current.timeOfDay3d ?? 'day') === 'night';
-    renderer.toneMappingExposure = initNight ? 1.18 : 0.96;
+    renderer.toneMappingExposure = (initNight ? 0.94 : 0.96) * initGx.exposure;
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(initNight ? '#060B18' : '#DCE8F5');
     scene.fog = new THREE.Fog(initNight ? '#060B18' : '#DCE8F5', 34, 120);
@@ -232,8 +337,10 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
 
     // Studio PBR environment reflections for metallic hardware, mirrors & physical roughness contrast
     const pmrem = new THREE.PMREMGenerator(renderer);
-    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    scene.environmentIntensity = initNight ? 0.1 : 0.22;
+    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    envTexRef.current = envTex;
+    scene.environment = initGx.environmentMapQuality === 'off' ? null : envTex;
+    scene.environmentIntensity = initNight ? 0.11 : 0.22;
     pmrem.dispose();
 
     const initW = container.clientWidth || 800;
@@ -250,13 +357,12 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     if (!isSoftwareGl) {
       RectAreaLightUniformsLib.init();
       const dpr = renderer.getPixelRatio();
-      const maxSamples = Math.min(4, renderer.capabilities.maxSamples || 0);
       const rt = new THREE.WebGLRenderTarget(
         Math.max(1, Math.floor(initW * dpr)),
         Math.max(1, Math.floor(initH * dpr)),
         {
           type: THREE.HalfFloatType,
-          samples: maxSamples,
+          samples: 0,
         }
       );
       composerRtRef.current = rt;
@@ -264,16 +370,129 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       composer.setPixelRatio(dpr);
       composer.setSize(initW, initH);
       composer.addPass(new RenderPass(scene, camera));
+
+      const gtaoPass = new GTAOPass(scene, camera, initW, initH);
+      gtaoPass.output = GTAOPass.OUTPUT.Default;
+      gtaoPass.blendIntensity = initGx.ambientOcclusionIntensity;
+      gtaoPass.updateGtaoMaterial({
+        radius: 0.42,
+        distanceExponent: 1.5,
+        thickness: 1.2,
+        samples:
+          initGx.ambientOcclusionQuality === 'high'
+            ? 24
+            : initGx.ambientOcclusionQuality === 'medium'
+              ? 14
+              : 8,
+      });
+      gtaoPass.enabled =
+        initGx.ambientOcclusionQuality !== 'off' && initGx.ambientOcclusionIntensity > 0.005;
+      composer.addPass(gtaoPass);
+      gtaoPassRef.current = gtaoPass;
+
+      // Sanitize NaN, Infinity, and extreme specular fireflies before UnrealBloomPass
+      const hdrSanitizePass = new ShaderPass({
+        uniforms: {
+          tDiffuse: { value: null },
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D tDiffuse;
+          varying vec2 vUv;
+          void main() {
+            vec4 texel = texture2D(tDiffuse, vUv);
+            vec3 c = texel.rgb;
+            c.r = (c.r >= 0.0 && c.r <= 12.0) ? c.r : (c.r > 12.0 ? 12.0 : 0.0);
+            c.g = (c.g >= 0.0 && c.g <= 12.0) ? c.g : (c.g > 12.0 ? 12.0 : 0.0);
+            c.b = (c.b >= 0.0 && c.b <= 12.0) ? c.b : (c.b > 12.0 ? 12.0 : 0.0);
+            gl_FragColor = vec4(c, clamp(texel.a, 0.0, 1.0));
+          }
+        `,
+      });
+      composer.addPass(hdrSanitizePass);
+
       const bloomPass = new UnrealBloomPass(
         new THREE.Vector2(initW, initH),
-        initNight ? 0.34 : 0.055,
-        initNight ? 0.44 : 0.26,
-        initNight ? 0.96 : 1.38
+        (initNight ? 0.12 : 0.055) * initGx.bloomIntensity,
+        initNight ? 0.28 : 0.26,
+        initNight ? 1.24 : 1.38
       );
+      bloomPass.enabled = initGx.bloomIntensity > 0.005;
       composer.addPass(bloomPass);
-      composer.addPass(new OutputPass());
-      composerRef.current = composer;
       bloomPassRef.current = bloomPass;
+
+      const bokehPass = new BokehPass(scene, camera, {
+        focus: initGx.depthOfFieldFocusM,
+        aperture: initGx.depthOfFieldAperture * 0.0012,
+        maxblur: 0.008,
+      });
+      bokehPass.setSize(initW, initH);
+      bokehPass.enabled = initGx.depthOfFieldEnabled;
+      composer.addPass(bokehPass);
+      bokehPassRef.current = bokehPass;
+
+      // SMAA operates in linear-srgb before OutputPass
+      const smaaPass = new SMAAPass();
+      smaaPass.setSize(initW * dpr, initH * dpr);
+      smaaPass.enabled = initGx.antiAliasing === 'smaa';
+      composer.addPass(smaaPass);
+      smaaPassRef.current = smaaPass;
+
+      composer.addPass(new OutputPass());
+
+      // Post-tonemap contrast & subtle optical vignette (sRGB space)
+      const colorGradePass = new ShaderPass({
+        uniforms: {
+          tDiffuse: { value: null },
+          uContrast: { value: initGx.contrast },
+          uVignette: { value: initGx.vignetteIntensity },
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D tDiffuse;
+          uniform float uContrast;
+          uniform float uVignette;
+          varying vec2 vUv;
+          void main() {
+            vec4 texel = texture2D(tDiffuse, vUv);
+            vec3 col = clamp((texel.rgb - 0.5) * uContrast + 0.5, 0.0, 1.0);
+            if (uVignette > 0.001) {
+              vec2 d = vUv - 0.5;
+              float vig = smoothstep(0.9, 0.28, dot(d, d) * 2.2);
+              col *= mix(1.0, vig, uVignette);
+            }
+            gl_FragColor = vec4(col, texel.a);
+          }
+        `,
+      });
+      colorGradePass.enabled =
+        Math.abs(initGx.contrast - 1.0) > 0.005 || initGx.vignetteIntensity > 0.005;
+      composer.addPass(colorGradePass);
+      colorGradePassRef.current = colorGradePass;
+
+      // FXAA operates in sRGB after OutputPass
+      const fxaaPass = new ShaderPass(FXAAShader);
+      fxaaPass.uniforms['resolution'].value.set(
+        1 / Math.max(1, initW * dpr),
+        1 / Math.max(1, initH * dpr)
+      );
+      fxaaPass.enabled = initGx.antiAliasing === 'fxaa';
+      composer.addPass(fxaaPass);
+      fxaaPassRef.current = fxaaPass;
+
+      composerRef.current = composer;
     }
 
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -319,13 +538,17 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         void main() {
           vec3 dir = normalize(vWorldDir);
           float h = dir.y;
-          vec3 col = mix(uHorizonColor, uTopColor, pow(clamp(h, 0.0, 1.0), 0.55));
-          if (h < 0.0) {
-            col = mix(uHorizonColor, uGroundColor, pow(clamp(-h * 3.0, 0.0, 1.0), 0.7));
+          float hUp = max(clamp(h, 0.0, 1.0), 0.0001);
+          vec3 col = mix(uHorizonColor, uTopColor, pow(hUp, 0.55));
+          if (h < -0.0001) {
+            float hDown = max(clamp(-h * 3.0, 0.0, 1.0), 0.0001);
+            col = mix(uHorizonColor, uGroundColor, pow(hDown, 0.7));
           }
           float sunAmt = max(dot(dir, normalize(uSunDir)), 0.0);
-          col += uSunGlowColor * pow(sunAmt, 16.0) * 0.24;
-          col += uSunGlowColor * pow(sunAmt, 160.0) * 0.42;
+          if (sunAmt > 0.001) {
+            col += uSunGlowColor * pow(sunAmt, 16.0) * 0.24;
+            col += uSunGlowColor * pow(sunAmt, 160.0) * 0.42;
+          }
           gl_FragColor = vec4(col, 1.0);
         }
       `,
@@ -457,9 +680,10 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     scene.add(hemi);
     hemiLightRef.current = hemi;
 
+    const maxHardwareShadow = renderer.capabilities.maxTextureSize || 2048;
     const shadowMapSize = isSoftwareGl
-      ? 1024
-      : Math.min(4096, renderer.capabilities.maxTextureSize || 2048);
+      ? 512
+      : Math.min(maxHardwareShadow, initGx.shadowResolution);
     const keyLight = new THREE.DirectionalLight(0xfffaf0, 1.72);
     keyLight.position.set(10, 14, 9);
     keyLight.castShadow = !isSoftwareGl && settingsRef.current.shadowsEnabled;
@@ -472,7 +696,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     keyLight.shadow.camera.far = 65;
     keyLight.shadow.bias = -0.00015;
     keyLight.shadow.normalBias = 0.008;
-    keyLight.shadow.radius = 2.4;
+    keyLight.shadow.radius = initGx.shadowSoftness;
     scene.add(keyLight);
     scene.add(keyLight.target);
     keyLightRef.current = keyLight;
@@ -714,22 +938,85 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         stars.visible = m > 0.05;
         starMat.opacity = Math.max(0, (m - 0.1) / 0.9) * 0.9;
 
-        // Elevation-aware sun color & smoothly interpolated Day/Night IBL + restrained daytime bloom
-        scene.environmentIntensity = THREE.MathUtils.lerp(0.22, 0.1, m);
-        renderer.toneMappingExposure = THREE.MathUtils.lerp(0.96, 1.18, m);
+        // Elevation-aware sun color & smoothly interpolated Day/Night IBL + graphics settings
+        const gx = graphicsRef.current;
+        const envMul =
+          gx.environmentMapQuality === 'off'
+            ? 0
+            : gx.environmentMapQuality === 'low'
+              ? 0.45
+              : gx.environmentMapQuality === 'medium'
+                ? 0.75
+                : 1.0;
+        const giHemiMul =
+          gx.globalIlluminationQuality === 'off'
+            ? 0.55
+            : gx.globalIlluminationQuality === 'low'
+              ? 0.8
+              : gx.globalIlluminationQuality === 'medium'
+                ? 1.0
+                : 1.15;
+        const giRimMul =
+          gx.globalIlluminationQuality === 'off'
+            ? 0.4
+            : gx.globalIlluminationQuality === 'low'
+              ? 0.75
+              : gx.globalIlluminationQuality === 'medium'
+                ? 1.0
+                : 1.15;
+        const giBounceMul =
+          gx.globalIlluminationQuality === 'off'
+            ? 0
+            : gx.globalIlluminationQuality === 'low'
+              ? 0.55
+              : gx.globalIlluminationQuality === 'medium'
+                ? 1.0
+                : 1.35;
+
+        scene.environment = gx.environmentMapQuality === 'off' ? null : envTexRef.current;
+        scene.environmentIntensity = THREE.MathUtils.lerp(0.22, 0.11, m) * envMul;
+        renderer.toneMappingExposure = THREE.MathUtils.lerp(0.96, 0.94, m) * gx.exposure;
         if (bloomPassRef.current) {
-          bloomPassRef.current.threshold = THREE.MathUtils.lerp(1.38, 0.96, m);
-          bloomPassRef.current.strength = THREE.MathUtils.lerp(0.055, 0.34, m);
-          bloomPassRef.current.radius = THREE.MathUtils.lerp(0.26, 0.44, m);
+          bloomPassRef.current.enabled = gx.bloomIntensity > 0.005;
+          bloomPassRef.current.threshold = THREE.MathUtils.lerp(1.38, 1.24, m);
+          bloomPassRef.current.strength =
+            THREE.MathUtils.lerp(0.055, 0.12, m) * gx.bloomIntensity;
+          bloomPassRef.current.radius = THREE.MathUtils.lerp(0.26, 0.28, m);
+        }
+        if (gtaoPassRef.current) {
+          const aoActive =
+            !isSoftwareGl &&
+            gx.ambientOcclusionQuality !== 'off' &&
+            gx.ambientOcclusionIntensity > 0.005;
+          gtaoPassRef.current.enabled = aoActive;
+          gtaoPassRef.current.blendIntensity = gx.ambientOcclusionIntensity;
+        }
+        if (bokehPassRef.current) {
+          bokehPassRef.current.enabled = !isSoftwareGl && gx.depthOfFieldEnabled;
+          const bokehUniforms = bokehPassRef.current.uniforms as Record<string, THREE.IUniform>;
+          bokehUniforms.focus.value = gx.depthOfFieldFocusM;
+          bokehUniforms.aperture.value = gx.depthOfFieldAperture * 0.0012;
+        }
+        if (smaaPassRef.current) {
+          smaaPassRef.current.enabled = !isSoftwareGl && gx.antiAliasing === 'smaa';
+        }
+        if (colorGradePassRef.current) {
+          colorGradePassRef.current.uniforms['uContrast'].value = gx.contrast;
+          colorGradePassRef.current.uniforms['uVignette'].value = gx.vignetteIntensity;
+          colorGradePassRef.current.enabled =
+            Math.abs(gx.contrast - 1.0) > 0.005 || gx.vignetteIntensity > 0.005;
+        }
+        if (fxaaPassRef.current) {
+          fxaaPassRef.current.enabled = !isSoftwareGl && gx.antiAliasing === 'fxaa';
         }
         if (hemiLightRef.current) {
-          hemiLightRef.current.intensity = THREE.MathUtils.lerp(0.36, 0.2, m);
+          hemiLightRef.current.intensity = THREE.MathUtils.lerp(0.36, 0.22, m) * giHemiMul;
           hemiLightRef.current.color.setHex(0xd8ecff).lerp(new THREE.Color(0x1e293b), m);
           hemiLightRef.current.groundColor.setHex(0x475569).lerp(new THREE.Color(0x0f172a), m);
         }
         if (keyLightRef.current) {
           const daySunColor = new THREE.Color(lowSunFactor > 0.4 ? '#FFD8A8' : '#FFF9EF');
-          keyLightRef.current.intensity = THREE.MathUtils.lerp(1.72, 0.52, m);
+          keyLightRef.current.intensity = THREE.MathUtils.lerp(1.72, 0.42, m);
           keyLightRef.current.color.copy(daySunColor).lerp(new THREE.Color('#93C5FD'), m);
           const { cx, cz, radius } = planBoundsRef.current;
           const distR = Math.max(18, radius * 1.9);
@@ -743,23 +1030,23 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
           keyLightRef.current.target.updateMatrixWorld();
         }
         if (rimLightRef.current) {
-          rimLightRef.current.intensity = THREE.MathUtils.lerp(0.32, 0.22, m);
+          rimLightRef.current.intensity = THREE.MathUtils.lerp(0.32, 0.18, m) * giRimMul;
           rimLightRef.current.color.setHex(0xbfdbfe).lerp(new THREE.Color(0x60a5fa), m);
         }
         if (bounceLightRef.current) {
-          bounceLightRef.current.intensity = THREE.MathUtils.lerp(0.16, 0.08, m);
+          bounceLightRef.current.intensity = THREE.MathUtils.lerp(0.16, 0.06, m) * giBounceMul;
           bounceLightRef.current.color.setHex(0xf3ede2).lerp(new THREE.Color(0x334155), m);
         }
         for (const item of windowAreaLightsRef.current) {
-          item.light.intensity = item.baseIntensity * THREE.MathUtils.lerp(0.55, 0.14, m);
+          item.light.intensity = item.baseIntensity * THREE.MathUtils.lerp(0.55, 0.12, m);
           item.light.color.setHex(0xeef6ff).lerp(new THREE.Color(0x60a5fa), m);
         }
-        for (const item of lampLightsRef.current) {
-          item.light.intensity = item.baseIntensity * THREE.MathUtils.lerp(0.24, 1.35, m);
+        for (const item of activeLampLightsRef.current) {
+          item.light.intensity = item.baseIntensity * THREE.MathUtils.lerp(0.24, 0.62, m);
         }
         for (const item of emissiveTargetsRef.current) {
           const dayMul = item.alwaysVisible ? 0.85 : 0.38;
-          const nightMul = item.alwaysVisible ? 1.22 : 0.98;
+          const nightMul = item.alwaysVisible ? 0.94 : 0.78;
           item.mat.emissiveIntensity = item.baseIntensity * THREE.MathUtils.lerp(dayMul, nightMul, m);
         }
 
@@ -966,15 +1253,32 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       for (const entry of entries) {
         const w = Math.max(100, entry.contentRect.width);
         const h = Math.max(100, entry.contentRect.height);
+        const dpr = getEffectiveDpr(graphicsRef.current.renderScale, isSoftwareGl);
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
+        renderer.setPixelRatio(dpr);
         renderer.setSize(w, h);
         if (composerRef.current) {
-          composerRef.current.setPixelRatio(renderer.getPixelRatio());
+          composerRef.current.setPixelRatio(dpr);
           composerRef.current.setSize(w, h);
+        }
+        if (gtaoPassRef.current) {
+          gtaoPassRef.current.setSize(w, h);
         }
         if (bloomPassRef.current) {
           bloomPassRef.current.resolution.set(w, h);
+        }
+        if (bokehPassRef.current) {
+          bokehPassRef.current.setSize(w, h);
+        }
+        if (smaaPassRef.current) {
+          smaaPassRef.current.setSize(w * dpr, h * dpr);
+        }
+        if (fxaaPassRef.current) {
+          fxaaPassRef.current.uniforms['resolution'].value.set(
+            1 / Math.max(1, w * dpr),
+            1 / Math.max(1, h * dpr)
+          );
         }
         requestRender();
       }
@@ -1019,8 +1323,14 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         }
       }
       controls.dispose();
+      gtaoPassRef.current?.dispose();
+      bokehPassRef.current?.dispose();
+      smaaPassRef.current?.dispose();
+      bloomPassRef.current?.dispose();
       composerRef.current?.dispose();
       composerRtRef.current?.dispose();
+      envTexRef.current?.dispose();
+      envTexRef.current = null;
       skyGeo.dispose();
       skyMat.dispose();
       sunCoreGeo.dispose();
@@ -1044,13 +1354,14 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 2. Sync scene settings (3D Day/Night target, sun position, FOV, shadows) - decoupled from UI darkMode!
+  // 2. Sync scene settings (3D Day/Night target, sun position, FOV, shadows & lightweight graphics uniforms)
   useEffect(() => {
     const scene = sceneRef.current;
     const camera = cameraRef.current;
     const renderer = rendererRef.current;
     const keyLight = keyLightRef.current;
     const grid = gridHelperRef.current;
+    const container = mountRef.current;
     if (!scene || !camera || !renderer || !keyLight) return;
 
     targetNightMixRef.current = (settings.timeOfDay3d ?? 'day') === 'night' ? 1 : 0;
@@ -1068,8 +1379,63 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     camera.fov = getEffectiveFovDeg(presetRef.current, settings.fovDeg);
     camera.updateProjectionMatrix();
 
+    const dpr = getEffectiveDpr(graphicsSettings.renderScale, isSoftwareGlRef.current);
+    const w = container?.clientWidth || 800;
+    const h = container?.clientHeight || 600;
+    if (Math.abs(renderer.getPixelRatio() - dpr) > 0.01) {
+      renderer.setPixelRatio(dpr);
+      renderer.setSize(w, h);
+      if (composerRef.current) {
+        composerRef.current.setPixelRatio(dpr);
+        composerRef.current.setSize(w, h);
+      }
+      if (smaaPassRef.current) {
+        smaaPassRef.current.setSize(w * dpr, h * dpr);
+      }
+    }
+    if (fxaaPassRef.current) {
+      fxaaPassRef.current.uniforms['resolution'].value.set(
+        1 / Math.max(1, w * dpr),
+        1 / Math.max(1, h * dpr)
+      );
+    }
+
     renderer.shadowMap.enabled = !isSoftwareGlRef.current && settings.shadowsEnabled;
     keyLight.castShadow = !isSoftwareGlRef.current && settings.shadowsEnabled;
+    keyLight.shadow.radius = graphicsSettings.shadowSoftness;
+    const targetShadowType =
+      graphicsSettings.shadowSoftness <= 0.35 ? THREE.BasicShadowMap : THREE.PCFSoftShadowMap;
+    if (renderer.shadowMap.type !== targetShadowType) {
+      renderer.shadowMap.type = targetShadowType;
+      renderer.shadowMap.needsUpdate = true;
+      scene.traverse((obj) => {
+        const mesh = obj as THREE.Mesh;
+        if (mesh.isMesh) {
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach((mat) => {
+              mat.needsUpdate = true;
+            });
+          } else if (mesh.material) {
+            mesh.material.needsUpdate = true;
+          }
+        }
+      });
+    }
+
+    if (gtaoPassRef.current && graphicsSettings.ambientOcclusionQuality !== 'off') {
+      const samples =
+        graphicsSettings.ambientOcclusionQuality === 'high'
+          ? 24
+          : graphicsSettings.ambientOcclusionQuality === 'medium'
+            ? 14
+            : 8;
+      gtaoPassRef.current.updateGtaoMaterial({
+        radius: 0.42,
+        distanceExponent: 1.5,
+        thickness: 1.2,
+        samples,
+      });
+    }
 
     const { cx, cz, radius } = planBoundsRef.current;
     const distR = Math.max(18, radius * 1.9);
@@ -1080,12 +1446,15 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     );
     keyLight.target.position.set(cx, 0, cz);
     keyLight.target.updateMatrixWorld();
-    const shadowHalf = Math.max(10, radius + 3);
+    const shadowHalf = Math.min(
+      graphicsSettings.shadowDistanceM * 0.65,
+      Math.max(10, radius + 3)
+    );
     keyLight.shadow.camera.left = -shadowHalf;
     keyLight.shadow.camera.right = shadowHalf;
     keyLight.shadow.camera.top = shadowHalf;
     keyLight.shadow.camera.bottom = -shadowHalf;
-    keyLight.shadow.camera.far = distR * 2.5;
+    keyLight.shadow.camera.far = Math.max(distR * 2.5, graphicsSettings.shadowDistanceM * 2.2);
     keyLight.shadow.camera.updateProjectionMatrix();
 
     requestRenderRef.current();
@@ -1096,7 +1465,44 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     settings.showGrid,
     settings.sunAzimuthDeg,
     settings.sunElevationDeg,
+    graphicsSettings.renderScale,
+    graphicsSettings.globalIlluminationQuality,
+    graphicsSettings.shadowSoftness,
+    graphicsSettings.shadowDistanceM,
+    graphicsSettings.environmentMapQuality,
+    graphicsSettings.bloomIntensity,
+    graphicsSettings.exposure,
+    graphicsSettings.contrast,
+    graphicsSettings.ambientOcclusionQuality,
+    graphicsSettings.ambientOcclusionIntensity,
+    graphicsSettings.antiAliasing,
+    graphicsSettings.depthOfFieldEnabled,
+    graphicsSettings.depthOfFieldFocusM,
+    graphicsSettings.depthOfFieldAperture,
+    graphicsSettings.vignetteIntensity,
   ]);
+
+  // Close Graphics popover cleanly on Escape or outside pointerdown
+  useEffect(() => {
+    if (!showGraphicsPopover) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const wrap = graphicsPopoverWrapRef.current;
+      if (wrap && !wrap.contains(e.target as Node)) {
+        setShowGraphicsPopover(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setShowGraphicsPopover(false);
+      }
+    };
+    window.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [showGraphicsPopover]);
 
   // 3. Camera preset transitions & 175cm Walk Mode entry/exit
   useEffect(() => {
@@ -1237,12 +1643,24 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     contentGroup.clear();
     wallGroupsRef.current = [];
     lampLightsRef.current = [];
+    activeLampLightsRef.current = [];
     emissiveTargetsRef.current = [];
     windowAreaLightsRef.current = [];
 
     const maxAniso = renderer.capabilities.getMaxAnisotropy();
     const isSoft = isSoftwareGlRef.current;
     const castShadows = !isSoft && settings.shadowsEnabled;
+
+    const targetShadowRes = isSoft
+      ? 512
+      : Math.min(renderer.capabilities.maxTextureSize || 2048, graphicsSettings.shadowResolution);
+    const keyLight = keyLightRef.current;
+    if (keyLight && keyLight.shadow.mapSize.x !== targetShadowRes) {
+      keyLight.shadow.map?.dispose();
+      keyLight.shadow.map = null;
+      keyLight.shadow.mapSize.set(targetShadowRes, targetShadowRes);
+      renderer.shadowMap.needsUpdate = true;
+    }
 
     // Active section clipping plane
     const clippingPlanes: THREE.Plane[] = [];
@@ -1255,7 +1673,17 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       clippingPlanes.push(new THREE.Plane().setFromNormalAndCoplanarPoint(normal, p1));
     }
 
-    const matOpts = { maxAnisotropy: maxAniso, clippingPlanes, isSoftwareGl: isSoft };
+    const matOpts: ArchitecturalMaterialOptions = {
+      maxAnisotropy: maxAniso,
+      anisotropyLevel: graphicsSettings.anisotropicFiltering,
+      textureResolution: graphicsSettings.textureResolution,
+      textureFiltering: graphicsSettings.textureFiltering,
+      materialQuality: graphicsSettings.materialQuality,
+      reflectionQuality: graphicsSettings.reflectionQuality,
+      transparentQuality: graphicsSettings.transparentMaterialQuality,
+      clippingPlanes,
+      isSoftwareGl: isSoft,
+    };
 
     // Update dynamic shadow frustum bounds from plan geometry
     let bMinX = Infinity;
@@ -1285,12 +1713,15 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         );
         kl.target.position.set(cx, 0, cz);
         kl.target.updateMatrixWorld();
-        const shadowHalf = Math.max(10, rad + 3);
+        const shadowHalf = Math.min(
+          graphicsSettings.shadowDistanceM * 0.65,
+          Math.max(10, rad + 3)
+        );
         kl.shadow.camera.left = -shadowHalf;
         kl.shadow.camera.right = shadowHalf;
         kl.shadow.camera.top = shadowHalf;
         kl.shadow.camera.bottom = -shadowHalf;
-        kl.shadow.camera.far = distR * 2.5;
+        kl.shadow.camera.far = Math.max(distR * 2.5, graphicsSettings.shadowDistanceM * 2.2);
         kl.shadow.camera.updateProjectionMatrix();
       }
     }
@@ -1527,10 +1958,16 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
         const wall = level.walls.find((w) => w.id === op.wallId);
         if (!wall) continue;
 
-        const { point, tangent } = getWallCenterlinePoint(wall, op.t);
+        const { point, tangent, normal } = getWallCenterlinePoint(wall, op.t);
         const angle = Math.atan2(tangent.y, tangent.x);
+        const { left: offL, right: offR } = wallOffsets(wall.thicknessMm, wall.alignment);
+        const centerOffsetM = (offL + offR) / 2000;
         const opGroup = new THREE.Group();
-        opGroup.position.set(point.x / 1000, 0, point.y / 1000);
+        opGroup.position.set(
+          point.x / 1000 + normal.x * centerOffsetM,
+          0,
+          point.y / 1000 + normal.y * centerOffsetM
+        );
         opGroup.rotation.y = -angle;
 
         const w = op.widthMm / 1000;
@@ -1538,6 +1975,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
           ? Math.min(wall.heightMm, settings.cutawayHeightMm)
           : wall.heightMm;
         const sill = op.sillHeightMm / 1000;
+        const isSlicedTop = settings.cutawayEnabled && op.sillHeightMm + op.heightMm >= maxWallH - 5;
         const h = Math.max(0.05, Math.min(op.heightMm, maxWallH - op.sillHeightMm)) / 1000;
         const thick = wall.thicknessMm / 1000 + 0.02;
         const fThick = op.frameThicknessMm / 1000;
@@ -1568,11 +2006,13 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
           jambR.receiveShadow = castShadows;
           opGroup.add(jambR);
 
-          const head = new THREE.Mesh(new THREE.BoxGeometry(w, fThick, thick), frameMat);
-          head.position.set(0, sill + h - fThick / 2, 0);
-          head.castShadow = castShadows;
-          head.receiveShadow = castShadows;
-          opGroup.add(head);
+          if (!isSlicedTop) {
+            const head = new THREE.Mesh(new THREE.BoxGeometry(w, fThick, thick), frameMat);
+            head.position.set(0, sill + h - fThick / 2, 0);
+            head.castShadow = castShadows;
+            head.receiveShadow = castShadows;
+            opGroup.add(head);
+          }
         }
 
         if (op.category === 'window') {
@@ -1591,6 +2031,7 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
               glassMat
             );
             disc.rotation.x = Math.PI / 2;
+            disc.scale.set(w / (2 * r), 1, h / (2 * r));
             disc.position.set(0, sill + h / 2, 0);
             disc.castShadow = false;
             disc.receiveShadow = false;
@@ -1615,13 +2056,16 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
             }
 
             const glassW = Math.max(0.1, w - fThick * 2);
-            const glassH = Math.max(0.1, h - fThick * 2);
-            const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.016), glassMat);
-            glass.position.set(0, sill + h / 2, 0);
-            glass.castShadow = false;
-            glass.receiveShadow = false;
-            glass.renderOrder = 12;
-            opGroup.add(glass);
+            const glassH = Math.max(0.1, isSlicedTop ? h - fThick : h - fThick * 2);
+            const glassCenterY = isSlicedTop ? sill + fThick + glassH / 2 : sill + h / 2;
+            if (op.subtype !== 'casement' && op.subtype !== 'awning') {
+              const glass = new THREE.Mesh(new THREE.BoxGeometry(glassW, glassH, 0.016), glassMat);
+              glass.position.set(0, glassCenterY, 0);
+              glass.castShadow = false;
+              glass.receiveShadow = false;
+              glass.renderOrder = 12;
+              opGroup.add(glass);
+            }
 
             if (
               op.subtype === 'double' ||
@@ -1893,7 +2337,13 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
           }
         }
 
-        // Exterior daylight window/glazed-door RectAreaLight portals (hardware GPUs)
+        // Exterior daylight window/glazed-door RectAreaLight portals (scaled by lightQuality)
+        const maxWindowPortals =
+          graphicsSettings.lightQuality === 'low'
+            ? 0
+            : graphicsSettings.lightQuality === 'medium'
+              ? 4
+              : 8;
         const isGlazedPortal =
           op.category === 'window' ||
           (op.category === 'door' &&
@@ -1901,7 +2351,12 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
               op.subtype === 'sliding' ||
               op.subtype === 'balcony_single' ||
               op.subtype === 'balcony_double'));
-        if (!isSoft && isGlazedPortal && windowAreaLightsRef.current.length < 8 && level.rooms.length > 0) {
+        if (
+          !isSoft &&
+          isGlazedPortal &&
+          windowAreaLightsRef.current.length < maxWindowPortals &&
+          level.rooms.length > 0
+        ) {
           const tLen = Math.hypot(tangent.x, tangent.y) || 1;
           const nX = -tangent.y / tLen;
           const nY = tangent.x / tLen;
@@ -2042,16 +2497,21 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
               mountingFace: mFace,
             });
             model.traverse((child) => {
-              if ((child as THREE.Mesh).isMesh) {
-                child.castShadow = castShadows;
-                child.receiveShadow = castShadows;
+              const mesh = child as THREE.Mesh;
+              if (mesh.isMesh) {
+                if (mesh.geometry && !mesh.geometry.attributes.normal) {
+                  mesh.geometry.computeVertexNormals();
+                }
+                mesh.castShadow = castShadows;
+                mesh.receiveShadow = castShadows;
               }
             });
             const glbEmissives = applyGlbEmissiveOverrides(
               model,
               f.glbEmissiveOverrides,
               nightMixRef.current,
-              clippingPlanes
+              clippingPlanes,
+              isFurnitureLightingActive(f)
             );
             for (const em of glbEmissives) {
               emissiveTargetsRef.current.push(em);
@@ -2065,7 +2525,13 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
                 tiltGroup.position.y += fGroup.position.y - box.min.y;
               }
             }
-            assignInteriorShadowBudget(lampLightsRef.current, castShadows, 3);
+            activeLampLightsRef.current = applyInteriorLightAndShadowBudget(
+              lampLightsRef.current,
+              nightMixRef.current,
+              graphicsSettings.maxRealtimeLights,
+              castShadows,
+              graphicsSettings.lightQuality
+            );
             requestRenderRef.current();
           });
           contentGroup.add(fGroup);
@@ -2091,6 +2557,35 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
             emissiveTargetsRef.current.push(em);
           }
           contentGroup.add(built.group);
+        }
+
+        // Contact shadow decal beneath grounded floor furniture
+        if (graphicsSettings.contactShadows && !isSoft && f.elevationMm === 0 && !isRugFurniture(f)) {
+          const mType = resolveFurnitureMountingType(f);
+          if (mType === 'floor' || mType === 'freestanding') {
+            const contactTex = getContactShadowTexture();
+            if (contactTex) {
+              const bounds = computeFurnitureBoundsMm(f.parts);
+              const wM = Math.max(0.22, bounds.widthMm / 1000) * 1.12;
+              const dM = Math.max(0.22, bounds.depthMm / 1000) * 1.12;
+              const decalMat = new THREE.MeshBasicMaterial({
+                map: contactTex,
+                transparent: true,
+                opacity: 0.28,
+                depthWrite: false,
+                polygonOffset: true,
+                polygonOffsetFactor: -1,
+                clippingPlanes,
+              });
+              const decalGeo = new THREE.PlaneGeometry(wM, dM);
+              const decal = new THREE.Mesh(decalGeo, decalMat);
+              decal.rotation.x = -Math.PI / 2;
+              decal.rotation.z = (-f.rotationDeg * Math.PI) / 180;
+              decal.position.set(f.xMm / 1000, 0.007, f.yMm / 1000);
+              decal.renderOrder = 1;
+              contentGroup.add(decal);
+            }
+          }
         }
       }
     }
@@ -2272,25 +2767,45 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
             sill.receiveShadow = castShadows;
             aGroup.add(sill);
           }
+        } else if (el.type === 'railing') {
+          const rCfg = resolveRailingConfig(el);
+          const rGroup = buildRailing3DGroup(
+            rCfg,
+            el.color || '#334155',
+            matOpts,
+            castShadows,
+            clippingPlanes
+          );
+          aGroup.add(rGroup);
         } else if (el.type.startsWith('stairs')) {
-          const steps = el.stepCount ?? 14;
-          const treadD = d / steps;
-          const riseH = h / steps;
-          for (let i = 0; i < steps; i++) {
-            const stepGeo = new THREE.BoxGeometry(w, riseH * 0.9, treadD * 1.04);
-            applyWorldSpaceUVs(stepGeo, 1.0, i * 11, true);
-            const stepMesh = new THREE.Mesh(stepGeo, mat);
-            stepMesh.position.set(0, (i + 0.5) * riseH, d / 2 - (i + 0.5) * treadD);
-            stepMesh.castShadow = castShadows;
-            stepMesh.receiveShadow = castShadows;
-            aGroup.add(stepMesh);
-          }
-          if (el.hasRailing) {
-            const railGeo = new THREE.BoxGeometry(0.04, 0.05, Math.hypot(d, h));
-            const rail = new THREE.Mesh(railGeo, accentMat);
-            rail.position.set(w / 2 - 0.03, h / 2 + 0.9, 0);
-            rail.rotation.x = Math.atan2(h, d);
-            aGroup.add(rail);
+          const stairGroup = buildStaircase3DGroup(
+            el,
+            targetCeilingMm,
+            rawH / 1000,
+            mat,
+            accentMat,
+            matOpts,
+            castShadows,
+            clippingPlanes
+          );
+          aGroup.add(stairGroup);
+        } else if (el.type === 'balcony' || el.type === 'platform') {
+          const geo = new THREE.BoxGeometry(w, h, d);
+          applyWorldSpaceUVs(geo, 1.0, el.id.length * 13, true);
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.position.y = h / 2;
+          mesh.castShadow = castShadows;
+          mesh.receiveShadow = castShadows;
+          aGroup.add(mesh);
+
+          const deckRails = buildHostDeckRailings3DGroup(
+            el,
+            matOpts,
+            castShadows,
+            clippingPlanes
+          );
+          if (deckRails) {
+            aGroup.add(deckRails);
           }
         } else if (el.type === 'fireplace') {
           const hearthGeo = new THREE.BoxGeometry(w * 1.1, 0.12, d * 1.1);
@@ -2331,8 +2846,14 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
       }
     }
 
-    // Enable shadow casting on up to 3 prioritized interior Point/Spot lights (total shadow casters <= 4 with Sun/Moon)
-    assignInteriorShadowBudget(lampLightsRef.current, castShadows, 3);
+    // Enforce real-time light count budget and interior shadow budget
+    activeLampLightsRef.current = applyInteriorLightAndShadowBudget(
+      lampLightsRef.current,
+      nightMixRef.current,
+      graphicsSettings.maxRealtimeLights,
+      castShadows,
+      graphicsSettings.lightQuality
+    );
 
     requestRenderRef.current();
     return () => {
@@ -2347,6 +2868,17 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
     settings.sunElevationDeg,
     cameraPreset,
     ceilingMode,
+    graphicsSettings.shadowResolution,
+    graphicsSettings.shadowDistanceM,
+    graphicsSettings.contactShadows,
+    graphicsSettings.lightQuality,
+    graphicsSettings.maxRealtimeLights,
+    graphicsSettings.textureResolution,
+    graphicsSettings.textureFiltering,
+    graphicsSettings.anisotropicFiltering,
+    graphicsSettings.materialQuality,
+    graphicsSettings.reflectionQuality,
+    graphicsSettings.transparentMaterialQuality,
   ]);
 
   const handleCapturePng = () => {
@@ -2506,6 +3038,43 @@ export const Viewport3D: React.FC<Viewport3DProps> = ({
             <Sun className="w-3 h-3" />
             Shadows
           </button>
+          <div ref={graphicsPopoverWrapRef} className="relative">
+            <button
+              type="button"
+              data-testid="viewport-graphics-btn"
+              onClick={() => setShowGraphicsPopover((o) => !o)}
+              aria-expanded={showGraphicsPopover}
+              title="3D Graphics Quality & Post-Processing Settings"
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[11px] cursor-pointer ${
+                showGraphicsPopover
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              <SlidersHorizontal className="w-3 h-3" />
+              <span>Graphics</span>
+              <span className="opacity-75 text-[10px] capitalize">
+                · {graphicsSettings.preset}
+              </span>
+            </button>
+
+            {showGraphicsPopover && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                onPointerDown={(e) => e.stopPropagation()}
+                className="absolute right-0 top-full mt-2 w-[360px] max-w-[92vw] bg-white/95 dark:bg-slate-900/95 border border-slate-200 dark:border-slate-800 rounded-xl shadow-2xl z-30 overflow-hidden"
+              >
+                <GraphicsSettingsPanel
+                  graphics={graphicsSettings}
+                  onSelectPreset={onSelectGraphicsPreset}
+                  onUpdateSetting={onUpdateGraphicsSettings}
+                  onReset={onResetGraphicsSettings}
+                  variant="popover"
+                  onClose={() => setShowGraphicsPopover(false)}
+                />
+              </div>
+            )}
+          </div>
           <button
             type="button"
             onClick={handleCapturePng}

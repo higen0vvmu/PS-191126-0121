@@ -31,6 +31,7 @@ import {
   PersonPose,
   Point2D,
   Project,
+  RailingStyleId,
   ViewMode,
 } from './types/plan';
 import { usePlanState } from './hooks/usePlanState';
@@ -81,6 +82,11 @@ import {
   resolveFurnitureMountingFace,
   resolveFurnitureMountingType,
 } from './utils/mounting';
+import {
+  DEFAULT_RAILING_STYLE,
+  buildRailingArchElementFromWorldPoints,
+  createDefaultRailingConfig,
+} from './utils/railings';
 import { uid } from './utils/units';
 
 export default function App() {
@@ -90,6 +96,10 @@ export default function App() {
     activeLevel,
     keybinds,
     updateKeybinds,
+    graphicsSettings,
+    selectGraphicsPreset,
+    updateGraphicsSettings,
+    resetGraphicsSettings,
     selection,
     setSelection,
     canUndo,
@@ -133,6 +143,7 @@ export default function App() {
     category: Opening['category'];
     subtype: Opening['subtype'];
   }>({ category: 'door', subtype: 'single' });
+  const [activeRailingStyle, setActiveRailingStyle] = useState<RailingStyleId>(DEFAULT_RAILING_STYLE);
   const [cameraPreset, setCameraPreset] = useState<CameraPreset>('perspective');
   const [zoomMultiplier, setZoomMultiplier] = useState(1);
   const [fitSignal, setFitSignal] = useState(0);
@@ -142,7 +153,7 @@ export default function App() {
   const [showImporter, setShowImporter] = useState(false);
   const [editingSvgFurnId, setEditingSvgFurnId] = useState<string | null>(null);
   const [assetVersion, setAssetVersion] = useState(0);
-  const [settingsTab, setSettingsTab] = useState<'general' | 'keybinds' | null>(null);
+  const [settingsTab, setSettingsTab] = useState<'general' | 'keybinds' | 'graphics' | null>(null);
   const [showTemplateMenu, setShowTemplateMenu] = useState(false);
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
@@ -252,7 +263,10 @@ export default function App() {
       }
       if (
         e.key === 'Delete' ||
-        (e.key === 'Backspace' && activeTool !== 'wall' && activeTool !== 'wall_arc')
+        (e.key === 'Backspace' &&
+          activeTool !== 'wall' &&
+          activeTool !== 'wall_arc' &&
+          activeTool !== 'railing')
       ) {
         e.preventDefault();
         deleteSelected();
@@ -341,7 +355,8 @@ export default function App() {
         } else if (action === 'arch') {
           setPendingOpeningSpec({ category: 'arch', subtype: 'round_arch' });
           setActiveTool('arch');
-        } else if (action === 'measure_distance') setActiveTool('measure_distance');
+        } else if (action === 'railing') setActiveTool('railing');
+        else if (action === 'measure_distance') setActiveTool('measure_distance');
         else if (action === 'measure_area') setActiveTool('measure_area');
         else if (action === 'text') setActiveTool('text');
         else if (action === 'arrow') setActiveTool('arrow');
@@ -553,6 +568,11 @@ export default function App() {
               tpl.category === 'Lighting'
                 ? { enabled: true, colorTempK: 3200, intensity: 0.6 }
                 : undefined,
+            isLight: tpl.isLight ?? (tpl.category === 'Lighting' ? true : undefined),
+            lightingEnabled:
+              tpl.isLight || tpl.category === 'Lighting'
+                ? (tpl.lightingEnabled ?? true)
+                : undefined,
             lights: cloneLightsWithFreshIds(tpl.lights),
             glbEmissiveOverrides: tpl.glbEmissiveOverrides
               ? tpl.glbEmissiveOverrides.map((ov) => ({
@@ -732,7 +752,25 @@ export default function App() {
               };
             }
           }
+          if (type === 'railing') {
+            placed = true;
+            const railEl = buildRailingArchElementFromWorldPoints(
+              id,
+              [
+                { xMm: 1500, yMm: 2600, elevationMm: 0 },
+                { xMm: 3700, yMm: 2600, elevationMm: 0 },
+              ],
+              activeRailingStyle,
+              { closed: false, name }
+            );
+            return {
+              ...lvl,
+              archElements: [...lvl.archElements, railEl],
+            };
+          }
           placed = true;
+          const isStairOrDeck =
+            type.startsWith('stairs') || type === 'balcony' || type === 'platform';
           return {
             ...lvl,
             archElements: [
@@ -753,7 +791,20 @@ export default function App() {
                 material: type === 'chimney' ? 'paint' : type === 'doorframe' ? 'oak' : 'concrete',
                 faceColors: type === 'chimney' ? getDefaultChimneyFaceColors(id) : undefined,
                 stepCount: 14,
-                hasRailing: true,
+                hasRailing: type !== 'platform',
+                ...(type.startsWith('stairs')
+                  ? {
+                      railingLeft: type === 'stairs_l' || type === 'stairs_u',
+                      railingRight: true,
+                      stairTurnDirection: 'right' as const,
+                    }
+                  : {}),
+                ...(type === 'balcony'
+                  ? { railingEdges: { front: true, left: true, right: true, back: false } }
+                  : {}),
+                ...(isStairOrDeck
+                  ? { railing: createDefaultRailingConfig(activeRailingStyle, dim.w) }
+                  : {}),
                 connectToCeiling: type === 'chimney',
                 visible: true,
                 locked: false,
@@ -772,7 +823,42 @@ export default function App() {
       }
       setActiveTool('select');
     },
-    [activeLevel.ceilingHeightMm, notify, project.settings.snapEnabled, updateActiveLevel, setSelection]
+    [
+      activeLevel.ceilingHeightMm,
+      activeRailingStyle,
+      notify,
+      project.settings.snapEnabled,
+      updateActiveLevel,
+      setSelection,
+    ]
+  );
+
+  const handlePlaceRailingPreset = useCallback(
+    (styleId: RailingStyleId) => {
+      setActiveRailingStyle(styleId);
+      const id = uid('rail');
+      const railEl = buildRailingArchElementFromWorldPoints(
+        id,
+        [
+          { xMm: 1500, yMm: 2600, elevationMm: 0 },
+          { xMm: 3700, yMm: 2600, elevationMm: 0 },
+        ],
+        styleId,
+        { closed: false }
+      );
+      updateActiveLevel(
+        (lvl) => ({
+          ...lvl,
+          archElements: [...lvl.archElements, railEl],
+        }),
+        false,
+        true,
+        `Add ${railEl.name}`
+      );
+      setSelection([{ kind: 'arch', id }]);
+      setActiveTool('select');
+    },
+    [updateActiveLevel, setSelection]
   );
 
   const handleActivateEyedropper = useCallback(
@@ -876,8 +962,12 @@ export default function App() {
       initialTab={settingsTab}
       keybinds={keybinds}
       settings={project.settings}
+      graphicsSettings={graphicsSettings}
       onChangeKeybinds={updateKeybinds}
       onUpdateSettings={updateSettings}
+      onSelectGraphicsPreset={selectGraphicsPreset}
+      onUpdateGraphicsSettings={updateGraphicsSettings}
+      onResetGraphicsSettings={resetGraphicsSettings}
       onClose={() => setSettingsTab(null)}
     />
   );
@@ -1254,6 +1344,7 @@ export default function App() {
               onPlaceFurniture={placeFurnitureTemplate}
               onPlacePerson={handlePlacePerson}
               onPlaceArchElement={handlePlaceArchElement}
+              onPlaceRailingPreset={handlePlaceRailingPreset}
               onUpdateLevel={updateActiveLevel}
               onOpenCustomBuilder={() => setShowCustomBuilder(true)}
               onOpenImporter={() => setShowImporter(true)}
@@ -1275,6 +1366,7 @@ export default function App() {
                 settings={project.settings}
                 activeTool={activeTool}
                 pendingOpeningSpec={pendingOpeningSpec}
+                activeRailingStyle={activeRailingStyle}
                 selection={selection}
                 zoomMultiplier={zoomMultiplier}
                 fitSignal={fitSignal}
@@ -1297,9 +1389,11 @@ export default function App() {
               <FloatingToolbox
                 activeTool={activeTool}
                 pendingOpeningSpec={pendingOpeningSpec}
+                activeRailingStyle={activeRailingStyle}
                 keybinds={keybinds}
                 onSelectTool={setActiveTool}
                 onSelectOpeningSpec={setPendingOpeningSpec}
+                onSelectRailingStyle={setActiveRailingStyle}
               />
             </div>
           )}
@@ -1329,9 +1423,13 @@ export default function App() {
               <Viewport3D
                 level={activeLevel}
                 settings={project.settings}
+                graphicsSettings={graphicsSettings}
                 cameraPreset={cameraPreset}
                 onCameraPresetChange={setCameraPreset}
                 onUpdateSettings={updateSettings}
+                onSelectGraphicsPreset={selectGraphicsPreset}
+                onUpdateGraphicsSettings={updateGraphicsSettings}
+                onResetGraphicsSettings={resetGraphicsSettings}
                 onCanvasReady={(fn) => {
                   capture3dFnRef.current = fn;
                 }}

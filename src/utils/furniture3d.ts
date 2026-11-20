@@ -20,6 +20,7 @@ import {
   applyProceduralPartEmissive,
   buildThreeLightsForFurniture,
   type EmissiveTargetEntry,
+  isFurnitureLightingActive,
   resolveEffectiveFurnitureLights,
   resolveLightSourceThreeColor,
   type SceneBulbLightEntry,
@@ -2126,11 +2127,15 @@ export function buildProceduralFurnitureGroup(
   tiltGroup.add(mirrorGroup);
 
   const isLighting = f.category === 'Lighting';
+  const lightingActive = isFurnitureLightingActive(f);
   const effectiveLights = resolveEffectiveFurnitureLights(f);
-  const firstActiveLight = effectiveLights.find((l) => l.enabled && l.intensity > 0);
+  const firstActiveLight = lightingActive
+    ? effectiveLights.find((l) => l.enabled && l.intensity > 0)
+    : undefined;
   const lightCfg = f.lightConfig ?? { enabled: true, colorTempK: 3200, intensity: 0.6 };
   const hasAnyActiveLampLight =
-    Array.isArray(f.lights) ? Boolean(firstActiveLight) : isLighting && lightCfg.enabled;
+    lightingActive &&
+    (Array.isArray(f.lights) ? Boolean(firstActiveLight) : isLighting && lightCfg.enabled);
   const lightColor = firstActiveLight
     ? resolveLightSourceThreeColor(firstActiveLight)
     : ctx.kelvinToColor(lightCfg.colorTempK);
@@ -2143,10 +2148,10 @@ export function buildProceduralFurnitureGroup(
   let partIdx = 0;
 
   const applyManualPartEmissive = (groupObj: THREE.Object3D, part: FurniturePart) => {
-    if (part.emissiveEnabled !== true) return;
+    if (!lightingActive || part.emissiveEnabled !== true) return;
     const emColor = new THREE.Color(part.emissiveColor || part.color || '#FFBE76');
     const baseEmissive =
-      Math.max(0, part.emissiveIntensity ?? 1.2) * Math.max(0.25, part.bloomBoost ?? 1.2);
+      Math.max(0, part.emissiveIntensity ?? 1.2) * Math.max(0.25, Math.min(1.6, part.bloomBoost ?? 1.0));
     const seenMats = new Set<THREE.Material>();
     groupObj.traverse((node) => {
       const m = (node as THREE.Mesh).material;
@@ -2158,7 +2163,7 @@ export function buildProceduralFurnitureGroup(
         const std = mat as THREE.MeshStandardMaterial;
         if ('emissive' in std) {
           std.emissive = emColor.clone();
-          std.emissiveIntensity = baseEmissive * THREE.MathUtils.lerp(0.85, 1.22, ctx.nightMix);
+          std.emissiveIntensity = baseEmissive * THREE.MathUtils.lerp(0.85, 0.94, ctx.nightMix);
           std.needsUpdate = true;
           emissiveTargets.push({ mat: std, baseIntensity: baseEmissive, alwaysVisible: true });
         }
@@ -2534,6 +2539,7 @@ export function buildProceduralFurnitureGroup(
       fallbackLightColor: lightColor,
       primaryLightIntensity,
       nightMix: ctx.nightMix,
+      masterLightingEnabled: lightingActive,
     });
     const isEmissivePart = Boolean(emissiveEntry);
     if (emissiveEntry) {

@@ -17,12 +17,12 @@ import {
   FlipVertical,
   Grid2x2,
   Layers,
+  Lightbulb,
   Lock,
   PenTool,
   Plus,
   RotateCcw,
   Scissors,
-  Sun,
   Trash2,
   Unlock,
 } from 'lucide-react';
@@ -110,10 +110,17 @@ import {
 } from '../utils/svgImport';
 import { hasAnyCustomViews } from '../utils/svgRepresentationRenderer';
 import { ColorMaterialPicker } from './ColorMaterialPicker';
-import { FurnitureLightingPanel } from './FurnitureLightingPanel';
+import { LightingEditorModal } from './LightingEditorModal';
 import { MetricInput, NumberField } from './MetricInput';
 import {
+  HostRailingIntegrationSection,
+  RailingInspectorSection,
+} from './RailingInspectorSection';
+import { extractEditableRailingElementsFromHost } from '../utils/railings';
+import {
   cloneLightsWithFreshIds,
+  isFurnitureLightingActive,
+  isFurnitureLightObject,
   resolveEffectiveFurnitureLights,
   scaleFurnitureLightSources,
 } from '../utils/lighting';
@@ -262,6 +269,7 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
   const [constraintError, setConstraintError] = useState<string | null>(null);
   const [repBusy, setRepBusy] = useState(false);
   const [confirmRegenFurnId, setConfirmRegenFurnId] = useState<string | null>(null);
+  const [lightingModalOpen, setLightingModalOpen] = useState(false);
 
   const primary = selection[0];
   const unit = settings.preferredUnit;
@@ -269,6 +277,7 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
   useEffect(() => {
     setConstraintError(null);
     setConfirmRegenFurnId(null);
+    setLightingModalOpen(false);
   }, [primary?.kind, primary?.id]);
 
   const reportConstraintError = (msg: string) => {
@@ -767,7 +776,7 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
           const cRot = getCommonValue(selectedFurn.map((f) => f.rotationDeg));
           const cColor = getCommonValue(selectedFurn.map((f) => (f.parts[0]?.color ?? '#FFFFFF').toUpperCase()));
           const cMat = getCommonValue(selectedFurn.map((f) => f.parts[0]?.material ?? 'wood'));
-          const allLights = selectedFurn.every((f) => f.category === 'Lighting');
+          const allLights = selectedFurn.every((f) => isFurnitureLightObject(f));
           const allFixedSize = selectedFurn.every((f) => isFixedSizeFurniture(f));
           const anyFixedSize = selectedFurn.some((f) => isFixedSizeFurniture(f));
 
@@ -848,66 +857,41 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
               </div>
 
               {allLights && (() => {
-                const cEnabled = getCommonValue(selectedFurn.map((f) => f.lightConfig?.enabled ?? true));
-                const cTemp = getCommonValue(selectedFurn.map((f) => f.lightConfig?.colorTempK ?? 3200));
-                const cInt = getCommonValue(selectedFurn.map((f) => f.lightConfig?.intensity ?? 1.0));
+                const cLit = getCommonValue(selectedFurn.map((f) => isFurnitureLightingActive(f)));
                 const setSet = new Set(furnIds);
-                const applyLightPatch = (patch: Partial<NonNullable<FurnitureInstance['lightConfig']>>, label: string) => {
+                const applyAllLit = (nextLit: boolean) => {
                   onUpdateLevel(
                     (lvl) => ({
                       ...lvl,
-                      furniture: lvl.furniture.map((f) => {
-                        if (!setSet.has(f.id) || f.locked) return f;
-                        const nextConfig = {
-                          enabled: true,
-                          colorTempK: 3200,
-                          intensity: 1.0,
-                          ...f.lightConfig,
-                          ...patch,
-                        };
-                        const nextLights = Array.isArray(f.lights)
-                          ? f.lights.map((l, idx) =>
-                              idx === 0
-                                ? {
-                                    ...l,
-                                    enabled: nextConfig.enabled,
-                                    colorTempK: nextConfig.colorTempK,
-                                    intensity: nextConfig.intensity,
-                                  }
-                                : l
-                            )
-                          : f.lights;
-                        return {
-                          ...f,
-                          lightConfig: nextConfig,
-                          ...(nextLights ? { lights: nextLights } : {}),
-                        };
-                      }),
+                      furniture: lvl.furniture.map((f) =>
+                        setSet.has(f.id) && !f.locked
+                          ? { ...f, lightingEnabled: nextLit }
+                          : f
+                      ),
                     }),
                     false,
                     true,
-                    label
+                    nextLit ? 'Turn Lights On' : 'Turn Lights Off'
                   );
                 };
                 return (
-                  <div className="border-t border-slate-200 dark:border-slate-800 pt-2 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold flex items-center gap-1.5"><Sun className="w-3.5 h-3.5 text-amber-500" />Shared Fixture Light</span>
-                      <button type="button" onClick={() => applyLightPatch({ enabled: cEnabled.mixed ? true : !cEnabled.value }, 'Toggle Lights')} className="px-2 py-0.5 border border-slate-200 dark:border-slate-700 rounded text-[11px] cursor-pointer">
-                        {cEnabled.mixed ? 'Mixed · Turn On' : cEnabled.value ? 'ON' : 'OFF'}
+                  <div className="border-t border-slate-200 dark:border-slate-800 pt-2.5">
+                    <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60 flex items-center justify-between gap-2">
+                      <span className="font-semibold flex items-center gap-1.5 text-slate-800 dark:text-slate-100">
+                        <Lightbulb className="w-3.5 h-3.5 text-amber-500" />
+                        Shared Lighting ({selectedFurn.length})
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => applyAllLit(cLit.mixed ? true : !cLit.value)}
+                        className={`px-2.5 py-1 rounded border text-[11px] font-medium cursor-pointer ${
+                          !cLit.mixed && cLit.value
+                            ? 'bg-amber-500/15 border-amber-500/60 text-amber-700 dark:text-amber-300'
+                            : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                        }`}
+                      >
+                        {cLit.mixed ? 'Mixed · Turn On' : cLit.value ? 'Lit: On' : 'Lit: Off'}
                       </button>
-                    </div>
-                    <div>
-                      <div className="flex justify-between text-[11px] text-slate-500">
-                        <span>Warmth</span><span>{cTemp.mixed ? 'Mixed' : `${cTemp.value}K`}</span>
-                      </div>
-                      <input type="range" min={2200} max={6500} step={100} value={cTemp.value} onChange={(e) => applyLightPatch({ colorTempK: Number(e.target.value) }, 'Light Color Temp')} className="w-full accent-amber-500" />
-                    </div>
-                    <div>
-                      <div className="flex justify-between text-[11px] text-slate-500">
-                        <span>Brightness</span><span>{cInt.mixed ? 'Mixed' : `${Math.round(cInt.value * 100)}%`}</span>
-                      </div>
-                      <input type="range" min={0.2} max={2.5} step={0.1} value={cInt.value} onChange={(e) => applyLightPatch({ intensity: Number(e.target.value) }, 'Light Brightness')} className="w-full accent-amber-500" />
                     </div>
                   </div>
                 );
@@ -3426,12 +3410,86 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
             );
           })()}
 
-          {/* ADVANCED MULTI-LIGHT & EMISSIVE GLOW PANEL (All furniture & GLB models) */}
-          <FurnitureLightingPanel
-            furn={furn}
-            settings={settings}
-            onUpdateFurn={updateFurn}
-          />
+          {/* COMPACT LIGHTING CONTROL CARD (Only for built-in Lighting fixtures or "Is a light" imports) */}
+          {isFurnitureLightObject(furn) && (() => {
+            const isLit = isFurnitureLightingActive(furn);
+            const sourcesCount = resolveEffectiveFurnitureLights(furn).length;
+            const glowCount =
+              (furn.glbEmissiveOverrides?.filter((ov) => ov.enabled).length ?? 0) +
+              furn.parts.filter((p) => p.emissiveEnabled).length;
+            return (
+              <div className="border-t border-slate-200 dark:border-slate-800 pt-2.5">
+                <div className="p-2.5 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Lightbulb
+                        className={`w-3.5 h-3.5 shrink-0 ${
+                          isLit ? 'text-amber-500' : 'text-slate-400'
+                        }`}
+                      />
+                      <span className="font-semibold text-slate-800 dark:text-slate-100">
+                        Lighting
+                      </span>
+                    </div>
+                    <span className="text-[10px] font-mono tabular-nums text-slate-500 truncate">
+                      {sourcesCount} source{sourcesCount === 1 ? '' : 's'}
+                      {glowCount > 0 ? ` · ${glowCount} glow` : ''}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2 pt-0.5">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={isLit}
+                      disabled={furn.locked}
+                      onClick={() =>
+                        updateFurn(
+                          { lightingEnabled: !isLit },
+                          isLit ? 'Turn Light Off' : 'Turn Light On'
+                        )
+                      }
+                      className={`flex-1 py-1.5 px-2.5 rounded-md border text-[11px] font-medium inline-flex items-center justify-between gap-2 cursor-pointer transition-colors disabled:opacity-40 ${
+                        isLit
+                          ? 'bg-amber-500/15 border-amber-500/60 text-amber-800 dark:text-amber-200'
+                          : 'bg-white dark:bg-slate-950 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      <span>Lit</span>
+                      <span
+                        className={`inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                          isLit ? 'bg-amber-500' : 'bg-slate-300 dark:bg-slate-700'
+                        }`}
+                      >
+                        <span
+                          className={`inline-block h-3 w-3 transform rounded-full bg-white shadow-xs transition-transform ${
+                            isLit ? 'translate-x-3.5' : 'translate-x-0.5'
+                          }`}
+                        />
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setLightingModalOpen(true)}
+                      className="px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-[11px] font-medium whitespace-nowrap cursor-pointer"
+                    >
+                      Edit
+                    </button>
+                  </div>
+                </div>
+
+                {lightingModalOpen && (
+                  <LightingEditorModal
+                    furn={furn}
+                    settings={settings}
+                    onUpdateFurn={updateFurn}
+                    onClose={() => setLightingModalOpen(false)}
+                  />
+                )}
+              </div>
+            );
+          })()}
 
         {/* MULTI-PART COMPONENT TREE & INDEPENDENT PART EDITOR (Hidden for fixed-size decor/small appliances) */}
         {isFixedSizeFurniture(furn) ? (
@@ -3700,6 +3758,10 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
                   defaultMountingFace: effMountingFace,
                   glbAssetId: furn.glbAssetId,
                   glbDataUrl: furn.glbDataUrl,
+                  isLight: isFurnitureLightObject(furn),
+                  lightingEnabled: isFurnitureLightObject(furn)
+                    ? isFurnitureLightingActive(furn)
+                    : undefined,
                   glbEmissiveOverrides: furn.glbEmissiveOverrides
                     ? furn.glbEmissiveOverrides.map((ov) => ({
                         ...ov,
@@ -3974,323 +4036,375 @@ export const PropertiesInspector: React.FC<PropertiesInspectorProps> = ({
             </div>
           )}
 
-          <div className="grid grid-cols-2 gap-2">
-            <MetricInput
-              label="Width"
-              valueMm={el.widthMm}
+          {el.type === 'railing' ? (
+            <RailingInspectorSection
+              el={el}
               unit={unit}
-              minMm={50}
-              onChangeMm={handleArchWidthChange}
+              recentColors={recentColors}
+              onUpdateEl={updateEl}
             />
-            <MetricInput
-              label="Depth"
-              valueMm={el.depthMm}
-              unit={unit}
-              minMm={50}
-              onChangeMm={handleDepthChange}
-            />
-            <MetricInput
-              label="Height"
-              valueMm={el.connectToCeiling ? level.ceilingHeightMm : el.heightMm}
-              unit={unit}
-              minMm={50}
-              onChangeMm={(mm) =>
-                updateEl({ heightMm: mm, connectToCeiling: false })
-              }
-            />
-            <MetricInput
-              label="Elevation"
-              valueMm={el.elevationMm}
-              unit={unit}
-              minMm={0}
-              onChangeMm={(mm) => updateEl({ elevationMm: mm })}
-            />
-            {!(el.type === 'chimney' && hostWall) && (
-              <NumberField
-                label="Rotation"
-                value={el.rotationDeg}
-                unitLabel="°"
-                onChange={(deg) => {
-                  if (
-                    el.type === 'chimney' &&
-                    doesChimneyOverlapWalls(el.xMm, el.yMm, el.widthMm, el.depthMm, deg, level.walls, 4)
-                  ) {
-                    reportConstraintError('Rotation would push chimney inside a wall.');
-                    return;
-                  }
-                  updateEl({ rotationDeg: deg });
-                }}
-              />
-            )}
-            {el.type.startsWith('stairs') && (
-              <NumberField
-                label="Steps"
-                value={el.stepCount ?? 14}
-                unitLabel="#"
-                min={3}
-                max={40}
-                onChange={(s) => updateEl({ stepCount: Math.round(s) })}
-              />
-            )}
-          </div>
-
-          {el.type === 'chimney' && (
-            <div className="space-y-2 border-t border-slate-200 dark:border-slate-800 pt-2">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span className="font-medium text-slate-700 dark:text-slate-300">
-                  Extend to Ceiling
-                </span>
-                <input
-                  type="checkbox"
-                  checked={Boolean(el.connectToCeiling)}
-                  onChange={(e) =>
-                    updateEl(
-                      {
-                        connectToCeiling: e.target.checked,
-                        heightMm: e.target.checked ? level.ceilingHeightMm : el.heightMm,
-                        elevationMm: e.target.checked ? 0 : el.elevationMm,
-                      },
-                      'Toggle Extend to Ceiling'
-                    )
-                  }
-                  className="accent-blue-600"
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-2">
+                <MetricInput
+                  label="Width"
+                  valueMm={el.widthMm}
+                  unit={unit}
+                  minMm={50}
+                  onChangeMm={handleArchWidthChange}
                 />
-              </label>
-
-              {hostWall ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const nextFace = el.attachedFace === 'right' ? 'left' : 'right';
-                    const wallLen = getWallArcLength(hostWall) || 1;
-                    const curS = (el.attachedT ?? 0.5) * wallLen;
-                    const faceBounds = computeChimneyFaceBounds(
-                      hostWall,
-                      level.walls,
-                      nextFace,
-                      el.depthMm,
-                      curS
-                    );
-                    if (faceBounds.maxS - faceBounds.minS < el.widthMm - 2) {
-                      reportConstraintError(
-                        'Cannot flip face: not enough clearance on the opposite wall face without overlapping a corner wall.'
-                      );
-                      return;
-                    }
-                    const clampedS = Math.max(
-                      faceBounds.minS + el.widthMm / 2,
-                      Math.min(faceBounds.maxS - el.widthMm / 2, curS)
-                    );
-                    const nextT = Math.max(0.001, Math.min(0.999, clampedS / wallLen));
-                    const tf = computeAttachedChimneyTransform(
-                      hostWall,
-                      nextT,
-                      el.depthMm,
-                      nextFace
-                    );
-                    if (
-                      doesChimneyOverlapWalls(
-                        tf.xMm,
-                        tf.yMm,
-                        el.widthMm,
-                        el.depthMm,
-                        tf.rotationDeg,
-                        level.walls,
-                        6
-                      )
-                    ) {
-                      reportConstraintError(
-                        'Cannot flip face: chimney would overlap an adjacent wall.'
-                      );
-                      return;
-                    }
-                    const nextPin = getChimneyCornerPin(
-                      hostWall,
-                      level.walls,
-                      nextT,
-                      el.widthMm,
-                      el.depthMm,
-                      nextFace
-                    );
-                    updateEl(
-                      {
-                        attachedFace: nextFace,
-                        attachedT: nextT,
-                        xMm: tf.xMm,
-                        yMm: tf.yMm,
-                        rotationDeg: tf.rotationDeg,
-                        resizeAnchor: nextPin ?? 'center',
-                      },
-                      'Flip Chimney Wall Face'
-                    );
-                  }}
-                  className="w-full py-1.5 px-2 border border-slate-200 dark:border-slate-700 rounded hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <ArrowLeftRight className="w-3.5 h-3.5" />
-                  Flip to Opposite Wall Face
-                </button>
-              ) : (
-                level.walls.some((w) => w.visible !== false) && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const snap = snapChimneyToWallEdge(
-                        { x: el.xMm, y: el.yMm },
-                        el.widthMm,
-                        el.depthMm,
-                        level.walls,
-                        level.openings,
-                        level.archElements,
-                        el.id,
-                        settings.snapEnabled
-                      );
-                      if (!snap) {
-                        reportConstraintError('No valid wall edge found for this chimney size.');
+                <MetricInput
+                  label="Depth"
+                  valueMm={el.depthMm}
+                  unit={unit}
+                  minMm={50}
+                  onChangeMm={handleDepthChange}
+                />
+                <MetricInput
+                  label="Height"
+                  valueMm={el.connectToCeiling ? level.ceilingHeightMm : el.heightMm}
+                  unit={unit}
+                  minMm={50}
+                  onChangeMm={(mm) =>
+                    updateEl({ heightMm: mm, connectToCeiling: false })
+                  }
+                />
+                <MetricInput
+                  label="Elevation"
+                  valueMm={el.elevationMm}
+                  unit={unit}
+                  minMm={0}
+                  onChangeMm={(mm) => updateEl({ elevationMm: mm })}
+                />
+                {!(el.type === 'chimney' && hostWall) && (
+                  <NumberField
+                    label="Rotation"
+                    value={el.rotationDeg}
+                    unitLabel="°"
+                    onChange={(deg) => {
+                      if (
+                        el.type === 'chimney' &&
+                        doesChimneyOverlapWalls(el.xMm, el.yMm, el.widthMm, el.depthMm, deg, level.walls, 4)
+                      ) {
+                        reportConstraintError('Rotation would push chimney inside a wall.');
                         return;
                       }
-                      updateEl(
-                        {
-                          attachedWallId: snap.wallId,
-                          attachedFace: snap.face,
-                          attachedT: snap.t,
-                          xMm: snap.xMm,
-                          yMm: snap.yMm,
-                          rotationDeg: snap.rotationDeg,
-                          resizeAnchor: snap.cornerPin ?? 'center',
-                        },
-                        'Snap Chimney to Wall Edge'
-                      );
+                      updateEl({ rotationDeg: deg });
                     }}
-                    className="w-full py-1.5 px-2 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/30 rounded hover:bg-blue-100 dark:hover:bg-blue-950/50 flex items-center justify-center gap-1.5 cursor-pointer"
-                  >
-                    <ArrowLeftRight className="w-3.5 h-3.5" />
-                    Snap Flush to Nearest Wall Edge
-                  </button>
-                )
-              )}
+                  />
+                )}
+                {el.type.startsWith('stairs') && (
+                  <NumberField
+                    label="Steps"
+                    value={el.stepCount ?? 14}
+                    unitLabel="#"
+                    min={3}
+                    max={40}
+                    onChange={(s) => updateEl({ stepCount: Math.round(s) })}
+                  />
+                )}
+              </div>
 
-              <label className="flex items-center justify-between cursor-pointer">
-                <span>Inherit Wall Baseboard</span>
-                <input
-                  type="checkbox"
-                  checked={Boolean(el.hasBaseboard)}
-                  onChange={(e) => updateEl({ hasBaseboard: e.target.checked })}
-                  className="accent-blue-600"
-                />
-              </label>
-              <label className="flex items-center justify-between cursor-pointer">
-                <span>Inherit Crown Molding</span>
-                <input
-                  type="checkbox"
-                  checked={Boolean(el.hasCrownMolding)}
-                  onChange={(e) => updateEl({ hasCrownMolding: e.target.checked })}
-                  className="accent-blue-600"
-                />
-              </label>
+              {el.type === 'chimney' && (
+                <div className="space-y-2 border-t border-slate-200 dark:border-slate-800 pt-2">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span className="font-medium text-slate-700 dark:text-slate-300">
+                      Extend to Ceiling
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(el.connectToCeiling)}
+                      onChange={(e) =>
+                        updateEl(
+                          {
+                            connectToCeiling: e.target.checked,
+                            heightMm: e.target.checked ? level.ceilingHeightMm : el.heightMm,
+                            elevationMm: e.target.checked ? 0 : el.elevationMm,
+                          },
+                          'Toggle Extend to Ceiling'
+                        )
+                      }
+                      className="accent-blue-600"
+                    />
+                  </label>
 
-              {/* 4 Unique Per-Face Colors */}
-              {(() => {
-                const fc = resolveChimneyFaceColors(el);
-                const faceDefs: Array<{ key: 'front' | 'back' | 'left' | 'right'; label: string }> = [
-                  { key: 'front', label: 'Front Face' },
-                  { key: 'back', label: 'Back Face' },
-                  { key: 'left', label: 'Left Face' },
-                  { key: 'right', label: 'Right Face' },
-                ];
-                return (
-                  <div className="space-y-1.5 border-t border-slate-200 dark:border-slate-800 pt-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
-                        Face Colors
-                      </span>
+                  {hostWall ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextFace = el.attachedFace === 'right' ? 'left' : 'right';
+                        const wallLen = getWallArcLength(hostWall) || 1;
+                        const curS = (el.attachedT ?? 0.5) * wallLen;
+                        const faceBounds = computeChimneyFaceBounds(
+                          hostWall,
+                          level.walls,
+                          nextFace,
+                          el.depthMm,
+                          curS
+                        );
+                        if (faceBounds.maxS - faceBounds.minS < el.widthMm - 2) {
+                          reportConstraintError(
+                            'Cannot flip face: not enough clearance on the opposite wall face without overlapping a corner wall.'
+                          );
+                          return;
+                        }
+                        const clampedS = Math.max(
+                          faceBounds.minS + el.widthMm / 2,
+                          Math.min(faceBounds.maxS - el.widthMm / 2, curS)
+                        );
+                        const nextT = Math.max(0.001, Math.min(0.999, clampedS / wallLen));
+                        const tf = computeAttachedChimneyTransform(
+                          hostWall,
+                          nextT,
+                          el.depthMm,
+                          nextFace
+                        );
+                        if (
+                          doesChimneyOverlapWalls(
+                            tf.xMm,
+                            tf.yMm,
+                            el.widthMm,
+                            el.depthMm,
+                            tf.rotationDeg,
+                            level.walls,
+                            6
+                          )
+                        ) {
+                          reportConstraintError(
+                            'Cannot flip face: chimney would overlap an adjacent wall.'
+                          );
+                          return;
+                        }
+                        const nextPin = getChimneyCornerPin(
+                          hostWall,
+                          level.walls,
+                          nextT,
+                          el.widthMm,
+                          el.depthMm,
+                          nextFace
+                        );
+                        updateEl(
+                          {
+                            attachedFace: nextFace,
+                            attachedT: nextT,
+                            xMm: tf.xMm,
+                            yMm: tf.yMm,
+                            rotationDeg: tf.rotationDeg,
+                            resizeAnchor: nextPin ?? 'center',
+                          },
+                          'Flip Chimney Wall Face'
+                        );
+                      }}
+                      className="w-full py-1.5 px-2 border border-slate-200 dark:border-slate-700 rounded hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <ArrowLeftRight className="w-3.5 h-3.5" />
+                      Flip to Opposite Wall Face
+                    </button>
+                  ) : (
+                    level.walls.some((w) => w.visible !== false) && (
                       <button
                         type="button"
-                        onClick={() =>
-                          updateEl({ faceColors: getDefaultChimneyFaceColors(el.id) }, 'Reset Chimney Face Colors')
-                        }
-                        className="inline-flex items-center gap-1 text-[10px] font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 cursor-pointer"
+                        onClick={() => {
+                          const snap = snapChimneyToWallEdge(
+                            { x: el.xMm, y: el.yMm },
+                            el.widthMm,
+                            el.depthMm,
+                            level.walls,
+                            level.openings,
+                            level.archElements,
+                            el.id,
+                            settings.snapEnabled
+                          );
+                          if (!snap) {
+                            reportConstraintError('No valid wall edge found for this chimney size.');
+                            return;
+                          }
+                          updateEl(
+                            {
+                              attachedWallId: snap.wallId,
+                              attachedFace: snap.face,
+                              attachedT: snap.t,
+                              xMm: snap.xMm,
+                              yMm: snap.yMm,
+                              rotationDeg: snap.rotationDeg,
+                              resizeAnchor: snap.cornerPin ?? 'center',
+                            },
+                            'Snap Chimney to Wall Edge'
+                          );
+                        }}
+                        className="w-full py-1.5 px-2 border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/30 rounded hover:bg-blue-100 dark:hover:bg-blue-950/50 flex items-center justify-center gap-1.5 cursor-pointer"
                       >
-                        <RotateCcw className="w-3 h-3" />
-                        Reset Auto
+                        <ArrowLeftRight className="w-3.5 h-3.5" />
+                        Snap Flush to Nearest Wall Edge
                       </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-1.5">
-                      {faceDefs.map(({ key, label }) => (
-                        <label
-                          key={key}
-                          className="flex items-center gap-1.5 px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 cursor-pointer"
-                        >
-                          <input
-                            type="color"
-                            value={fc[key]}
-                            onChange={(e) =>
-                              updateEl(
-                                { faceColors: { ...fc, [key]: e.target.value.toUpperCase() } },
-                                `Edit Chimney ${label} Color`
-                              )
-                            }
-                            aria-label={`${label} color`}
-                            className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent shrink-0"
-                          />
-                          <div className="min-w-0 leading-tight">
-                            <div className="text-[10px] font-medium text-slate-700 dark:text-slate-200 truncate">
-                              {label}
-                            </div>
-                            <div className="text-[9px] font-mono-nums text-slate-400">
-                              {fc[key]}
-                            </div>
-                          </div>
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })()}
-            </div>
-          )}
+                    )
+                  )}
 
-          {el.type.startsWith('stairs') && (
-            <label className="flex items-center justify-between cursor-pointer">
-              <span>Include Handrail</span>
-              <input type="checkbox" checked={Boolean(el.hasRailing)} onChange={(e) => updateEl({ hasRailing: e.target.checked })} className="accent-blue-600" />
-            </label>
-          )}
-          {el.type === 'doorframe' && (
-            <div className="space-y-2 border-t border-slate-200 dark:border-slate-800 pt-2">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span>Include Threshold Sill</span>
-                <input
-                  type="checkbox"
-                  checked={el.hasRailing !== false}
-                  onChange={(e) => updateEl({ hasRailing: e.target.checked }, 'Toggle Threshold Sill')}
-                  className="accent-blue-600"
-                />
-              </label>
-              {el.hasRailing !== false && (
-                <label className="flex items-center justify-between gap-2 cursor-pointer">
-                  <span className="text-[11px] text-slate-600 dark:text-slate-300">Threshold Color</span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="font-mono-nums text-[10px] text-slate-400">{el.accentColor}</span>
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span>Inherit Wall Baseboard</span>
                     <input
-                      type="color"
-                      value={el.accentColor}
-                      onChange={(e) => updateEl({ accentColor: e.target.value.toUpperCase() }, 'Edit Threshold Color')}
-                      aria-label="Threshold Sill Color"
-                      className="w-6 h-5 rounded border border-slate-300 dark:border-slate-700 cursor-pointer"
+                      type="checkbox"
+                      checked={Boolean(el.hasBaseboard)}
+                      onChange={(e) => updateEl({ hasBaseboard: e.target.checked })}
+                      className="accent-blue-600"
                     />
-                  </span>
-                </label>
+                  </label>
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span>Inherit Crown Molding</span>
+                    <input
+                      type="checkbox"
+                      checked={Boolean(el.hasCrownMolding)}
+                      onChange={(e) => updateEl({ hasCrownMolding: e.target.checked })}
+                      className="accent-blue-600"
+                    />
+                  </label>
+
+                  {/* 4 Unique Per-Face Colors */}
+                  {(() => {
+                    const fc = resolveChimneyFaceColors(el);
+                    const faceDefs: Array<{ key: 'front' | 'back' | 'left' | 'right'; label: string }> = [
+                      { key: 'front', label: 'Front Face' },
+                      { key: 'back', label: 'Back Face' },
+                      { key: 'left', label: 'Left Face' },
+                      { key: 'right', label: 'Right Face' },
+                    ];
+                    return (
+                      <div className="space-y-1.5 border-t border-slate-200 dark:border-slate-800 pt-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300">
+                            Face Colors
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateEl({ faceColors: getDefaultChimneyFaceColors(el.id) }, 'Reset Chimney Face Colors')
+                            }
+                            className="inline-flex items-center gap-1 text-[10px] font-medium text-blue-600 hover:text-blue-700 dark:text-blue-400 cursor-pointer"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            Reset Auto
+                          </button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-1.5">
+                          {faceDefs.map(({ key, label }) => (
+                            <label
+                              key={key}
+                              className="flex items-center gap-1.5 px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 cursor-pointer"
+                            >
+                              <input
+                                type="color"
+                                value={fc[key]}
+                                onChange={(e) =>
+                                  updateEl(
+                                    { faceColors: { ...fc, [key]: e.target.value.toUpperCase() } },
+                                    `Edit Chimney ${label} Color`
+                                  )
+                                }
+                                aria-label={`${label} color`}
+                                className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent shrink-0"
+                              />
+                              <div className="min-w-0 leading-tight">
+                                <div className="text-[10px] font-medium text-slate-700 dark:text-slate-200 truncate">
+                                  {label}
+                                </div>
+                                <div className="text-[9px] font-mono-nums text-slate-400">
+                                  {fc[key]}
+                                </div>
+                              </div>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
               )}
-            </div>
+
+              {(el.type.startsWith('stairs') || el.type === 'balcony' || el.type === 'platform') && (
+                <HostRailingIntegrationSection
+                  el={el}
+                  unit={unit}
+                  onUpdateEl={updateEl}
+                  onExtractEditableRailings={() => {
+                    const extracted = extractEditableRailingElementsFromHost(
+                      el,
+                      (prefix) => uid(prefix),
+                      level.ceilingHeightMm
+                    );
+                    if (extracted.length === 0) {
+                      reportConstraintError('Enable at least one side or edge railing before converting.');
+                      return;
+                    }
+                    onUpdateLevel(
+                      (lvl) => ({
+                        ...lvl,
+                        archElements: [
+                          ...lvl.archElements.map((a) =>
+                            a.id === el.id
+                              ? {
+                                  ...a,
+                                  hasRailing: false,
+                                  railingLeft: false,
+                                  railingRight: false,
+                                  railingEdges: {
+                                    front: false,
+                                    back: false,
+                                    left: false,
+                                    right: false,
+                                  },
+                                }
+                              : a
+                          ),
+                          ...extracted,
+                        ],
+                      }),
+                      false,
+                      true,
+                      `Convert ${el.name} Railings`
+                    );
+                    onSelect(extracted.map((r) => ({ kind: 'arch' as const, id: r.id })));
+                  }}
+                />
+              )}
+
+              {el.type === 'doorframe' && (
+                <div className="space-y-2 border-t border-slate-200 dark:border-slate-800 pt-2">
+                  <label className="flex items-center justify-between cursor-pointer">
+                    <span>Include Threshold Sill</span>
+                    <input
+                      type="checkbox"
+                      checked={el.hasRailing !== false}
+                      onChange={(e) => updateEl({ hasRailing: e.target.checked }, 'Toggle Threshold Sill')}
+                      className="accent-blue-600"
+                    />
+                  </label>
+                  {el.hasRailing !== false && (
+                    <label className="flex items-center justify-between gap-2 cursor-pointer">
+                      <span className="text-[11px] text-slate-600 dark:text-slate-300">Threshold Color</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="font-mono-nums text-[10px] text-slate-400">{el.accentColor}</span>
+                        <input
+                          type="color"
+                          value={el.accentColor}
+                          onChange={(e) => updateEl({ accentColor: e.target.value.toUpperCase() }, 'Edit Threshold Color')}
+                          aria-label="Threshold Sill Color"
+                          className="w-6 h-5 rounded border border-slate-300 dark:border-slate-700 cursor-pointer"
+                        />
+                      </span>
+                    </label>
+                  )}
+                </div>
+              )}
+              <ColorMaterialPicker
+                label={el.type === 'doorframe' ? 'Frame Material' : 'Primary Material'}
+                color={el.color}
+                material={el.material}
+                recentColors={recentColors}
+                onColorChange={(hex) => updateEl({ color: hex })}
+                onMaterialChange={(m) => updateEl({ material: m })}
+              />
+            </>
           )}
-          <ColorMaterialPicker
-            label={el.type === 'doorframe' ? 'Frame Material' : 'Primary Material'}
-            color={el.color}
-            material={el.material}
-            recentColors={recentColors}
-            onColorChange={(hex) => updateEl({ color: hex })}
-            onMaterialChange={(m) => updateEl({ material: m })}
-          />
         </div>
       </div>
     );

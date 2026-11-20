@@ -23,9 +23,12 @@ import {
   Level,
   PersonPose,
   Project,
+  RailingStyleId,
   SelectionTarget,
 } from '../types/plan';
 import { BUILTIN_CATALOG } from '../data/catalog';
+import { RAILING_STYLES } from '../utils/railings';
+import { RailingStyleThumb } from './RailingInspectorSection';
 import { computeFurnitureBoundsMm, computeWallSurfaceAreaM2 } from '../utils/geometry';
 import { renderPartVector2D } from '../utils/furnitureVectors';
 import {
@@ -47,6 +50,7 @@ interface LeftSidebarProps {
   onPlaceFurniture: (tpl: CatalogTemplate) => void;
   onPlacePerson: (pose: PersonPose, name: string, heightMm: number) => void;
   onPlaceArchElement: (type: ArchElementType, name: string) => void;
+  onPlaceRailingPreset?: (styleId: RailingStyleId) => void;
   onUpdateLevel: (
     updater: (lvl: Level) => Level,
     recomputeRooms?: boolean,
@@ -75,6 +79,8 @@ const ARCH_CATALOG_ITEMS: ArchCatalogItem[] = [
   { type: 'chimney', label: 'Chimney / Block', desc: 'Solid masonry shaft or chase' },
   { type: 'stairs_straight', label: 'Straight Stairs', desc: 'Linear stair flight with treads' },
   { type: 'stairs_l', label: 'L-Shape Stairs', desc: 'Quarter-turn landing stair' },
+  { type: 'stairs_u', label: 'U-Turn Stairs', desc: '180° return landing stair' },
+  { type: 'stairs_spiral', label: 'Spiral Stairs', desc: 'Compact helical winder stair' },
   { type: 'column_round', label: 'Round Column', desc: 'Cylindrical structural pillar' },
   { type: 'column_square', label: 'Square Column', desc: 'Square structural pillar' },
   { type: 'beam', label: 'Ceiling Beam', desc: 'Overhead structural beam' },
@@ -136,6 +142,39 @@ const ArchThumb: React.FC<{ type: ArchElementType }> = ({ type }) => {
           <line x1="20" y1="22" x2="62" y2="22" stroke="currentColor" strokeWidth="1.2" />
           <line x1="74" y1="28" x2="74" y2="46" stroke="currentColor" strokeWidth="1.2" />
           <line x1="86" y1="28" x2="86" y2="46" stroke="currentColor" strokeWidth="1.2" />
+        </g>
+      )}
+      {type === 'stairs_u' && (
+        <g>
+          <rect x="20" y="10" width="80" height="36" fill="#F8FAFC" stroke="currentColor" strokeWidth="2" />
+          <line x1="20" y1="28" x2="72" y2="28" stroke="currentColor" strokeWidth="1.8" />
+          <line x1="72" y1="10" x2="72" y2="46" stroke="currentColor" strokeWidth="1.2" />
+          {[32, 46, 60].map((x) => (
+            <g key={x}>
+              <line x1={x} y1="10" x2={x} y2="28" stroke="currentColor" strokeWidth="1.2" />
+              <line x1={x} y1="28" x2={x} y2="46" stroke="currentColor" strokeWidth="1.2" />
+            </g>
+          ))}
+        </g>
+      )}
+      {type === 'stairs_spiral' && (
+        <g>
+          <circle cx="60" cy="28" r="20" fill="#F8FAFC" stroke="currentColor" strokeWidth="2" />
+          <circle cx="60" cy="28" r="4" fill="currentColor" />
+          {[0, 45, 90, 135, 180, 225, 270, 315].map((a) => {
+            const rad = (a * Math.PI) / 180;
+            return (
+              <line
+                key={a}
+                x1={60 + Math.cos(rad) * 4}
+                y1={28 + Math.sin(rad) * 4}
+                x2={60 + Math.cos(rad) * 20}
+                y2={28 + Math.sin(rad) * 20}
+                stroke="currentColor"
+                strokeWidth="1.2"
+              />
+            );
+          })}
         </g>
       )}
       {type === 'column_round' && (
@@ -295,6 +334,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   onPlaceFurniture,
   onPlacePerson,
   onPlaceArchElement,
+  onPlaceRailingPreset,
   onUpdateLevel,
   onOpenCustomBuilder,
   onOpenImporter,
@@ -331,6 +371,17 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     if (!q) return ARCH_CATALOG_ITEMS;
     return ARCH_CATALOG_ITEMS.filter(
       (a) => a.label.toLowerCase().includes(q) || a.desc.toLowerCase().includes(q)
+    );
+  }, [search]);
+
+  const filteredRailingStyles = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return RAILING_STYLES;
+    return RAILING_STYLES.filter(
+      (r) =>
+        r.label.toLowerCase().includes(q) ||
+        r.description.toLowerCase().includes(q) ||
+        'railing balustrade handrail'.includes(q)
     );
   }, [search]);
 
@@ -538,28 +589,76 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             )}
 
             {catalogSubTab === 'architecture' && (
-              <div className="space-y-2">
-                <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                  Architectural Elements
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  {filteredArch.map((a) => (
-                    <button
-                      key={a.type}
-                      type="button"
-                      onClick={() => onPlaceArchElement(a.type, a.label)}
-                      className="text-left p-2 rounded-lg border border-slate-200 dark:border-slate-800 hover:border-blue-500 hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer"
-                    >
-                      <ArchThumb type={a.type} />
-                      <div className="mt-1 font-medium text-[11px] text-slate-800 dark:text-slate-100 truncate">
-                        {a.label}
-                      </div>
-                      <div className="text-[10px] text-slate-400 truncate">
-                        {a.desc}
-                      </div>
-                    </button>
-                  ))}
-                </div>
+              <div className="space-y-4">
+                {/* Railings & Balustrades Section */}
+                {filteredRailingStyles.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                        Railings &amp; Balustrades
+                      </span>
+                      <button
+                        type="button"
+                        data-testid="sidebar-draw-railing-btn"
+                        onClick={() => onToolChange('railing')}
+                        className="px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white text-[10px] font-medium cursor-pointer"
+                      >
+                        Draw Path
+                      </button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {filteredRailingStyles.map((st) => (
+                        <button
+                          key={st.id}
+                          type="button"
+                          data-testid={`catalog-railing-${st.id}`}
+                          onClick={() => {
+                            if (onPlaceRailingPreset) {
+                              onPlaceRailingPreset(st.id);
+                            } else {
+                              onPlaceArchElement('railing', `${st.label} Railing`);
+                            }
+                          }}
+                          className="text-left p-2 rounded-lg border border-slate-200 dark:border-slate-800 hover:border-blue-500 hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer"
+                        >
+                          <RailingStyleThumb styleId={st.id} className="w-full h-10 text-slate-700 dark:text-slate-200" />
+                          <div className="mt-1 font-medium text-[11px] text-slate-800 dark:text-slate-100 truncate">
+                            {st.shortLabel}
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {st.description}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {filteredArch.length > 0 && (
+                  <div className="space-y-2">
+                    <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                      Architectural Elements
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {filteredArch.map((a) => (
+                        <button
+                          key={a.type}
+                          type="button"
+                          onClick={() => onPlaceArchElement(a.type, a.label)}
+                          className="text-left p-2 rounded-lg border border-slate-200 dark:border-slate-800 hover:border-blue-500 hover:bg-blue-50/40 dark:hover:bg-blue-950/20 transition-colors cursor-pointer"
+                        >
+                          <ArchThumb type={a.type} />
+                          <div className="mt-1 font-medium text-[11px] text-slate-800 dark:text-slate-100 truncate">
+                            {a.label}
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate">
+                            {a.desc}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 

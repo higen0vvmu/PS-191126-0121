@@ -35,7 +35,7 @@ interface HomePageProps {
   onRenameProject: (id: string, name: string) => void;
   onDeleteProject: (id: string) => void;
   onImportProjectFile: (file: File) => void;
-  onOpenSettings: (tab?: 'general' | 'keybinds') => void;
+  onOpenSettings: (tab?: 'general' | 'keybinds' | 'graphics') => void;
 }
 
 type SortKey = 'updatedAt' | 'createdAt' | 'name';
